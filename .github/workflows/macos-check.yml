@@ -1,0 +1,88 @@
+name: macOS check
+
+# Runs the upstream macOS matrix legs against any ref, before a PR exists.
+#
+# Upstream runs macOS only on pushes to main and on pull requests against it,
+# so a macOS-only failure is first seen by a reviewer. This runs the same two
+# macOS legs on demand against any branch of this fork.
+#
+#   gh workflow run macos-check.yml -f ref=my-branch
+#   gh workflow run macos-check.yml -f ref=my-branch -f test=some_test_name
+#
+# The optional `test` input runs that one test five times with output shown,
+# which is what catches a platform difference that a single green run hides.
+#
+# This lives on the fork's default branch because workflow_dispatch only works
+# from there. It is never part of a PR: branches are cut from upstream/main.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or sha to test
+        required: true
+      test:
+        description: Optional test filter, run five times before the suite
+        required: false
+        default: ''
+
+env:
+  RUSTFLAGS: --cfg tokio_unstable
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (aarch64-apple-darwin, macos-latest)
+    runs-on: macos-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install and Display Rust specified toolchain
+        run: rustup show
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Repeat one test five times
+        if: inputs.test != ''
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "::group::run $i"
+            cargo test --target aarch64-apple-darwin --workspace \
+              "${{ inputs.test }}" -- --nocapture --test-threads=1
+            echo "::endgroup::"
+          done
+
+      - name: Test with latest nextest release
+        run: cargo nextest run --profile ci --workspace --target aarch64-apple-darwin
+
+  lint:
+    name: lint (aarch64-apple-darwin, macos-15)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install rustfmt and clippy
+        run: rustup component add clippy rustfmt
+
+      - run: cargo fetch
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: rustfmt
+        run: cargo fmt -- --check --color always
