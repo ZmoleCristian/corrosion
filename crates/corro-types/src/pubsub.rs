@@ -269,6 +269,7 @@ struct InnerMatcherHandle {
     hash: String,
     pool: sqlite_pool::RusqlitePool,
     parsed: ParsedSelect,
+    reactive_table_columns: IndexMap<String, HashSet<String>>,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
     changes_tx: mpsc::Sender<MatchCandidates>,
@@ -366,8 +367,7 @@ impl Handle for MatcherHandle {
         // don't consider changes that don't have both the table + col in the matcher query
         if !self
             .inner
-            .parsed
-            .table_columns
+            .reactive_table_columns
             .get(change.table.as_str())
             .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
             .unwrap_or_default()
@@ -606,6 +606,8 @@ pub struct Matcher {
     pub cached_statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
     pub parsed: ParsedSelect,
+    reactive_table_columns: IndexMap<String, HashSet<String>>,
+    full_recompute_tables: IndexSet<String>,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
     pub last_rowid: u64,
@@ -695,6 +697,22 @@ impl Matcher {
             return Err(MatcherError::TableRequired);
         }
 
+        let mut full_recompute_tables = parsed.subquery_trigger_tables(schema);
+        let subquery_table_columns = parsed.subquery_table_columns(schema);
+        let mut reactive_table_columns = parsed.table_columns.clone();
+        for (table, columns) in &subquery_table_columns {
+            reactive_table_columns
+                .entry(table.clone())
+                .or_default()
+                .extend(columns.iter().cloned());
+        }
+        for (name, columns) in &mut reactive_table_columns {
+            let table = &schema.tables[name];
+            if columns.iter().all(|column| table.pk.contains(column)) {
+                columns.extend(table.columns.keys().cloned());
+            }
+        }
+
         let mut statements = HashMap::new();
 
         let mut pks = IndexMap::default();
@@ -745,15 +763,14 @@ impl Matcher {
             _ => unreachable!(),
         }
 
+        state_conn.prepare(&Cmd::Stmt(stmt.clone()).to_string())?;
+
         for (idx, (tbl_name, _cols)) in parsed.table_columns.iter().enumerate() {
-            let expr = table_to_expr(
-                &parsed.aliases,
-                schema
-                    .tables
-                    .get(tbl_name)
-                    .expect("this should not happen, missing table in schema"),
-                tbl_name,
-            )?;
+            let table = schema
+                .tables
+                .get(tbl_name)
+                .ok_or_else(|| MatcherError::TableNotFound(tbl_name.clone()))?;
+            let expr = table_to_expr(&parsed.aliases, table, tbl_name)?;
 
             let mut stmt = stmt.clone();
 
@@ -776,18 +793,17 @@ impl Matcher {
                         Some(FromClause {
                             joins: Some(joins), ..
                         }) if idx > 0 => {
-                            // Replace LEFT JOIN with INNER join if the target is the joined table
+                            // Nullable-side changes share the subquery full-result path.
                             if let Some(JoinedSelectTable {
                                 operator:
                                     JoinOperator::TypedJoin {
-                                        join_type:
-                                            join_type @ Some(JoinType::LeftOuter | JoinType::Left),
+                                        join_type: Some(JoinType::LeftOuter | JoinType::Left),
                                         ..
                                     },
                                 ..
                             }) = joins.get_mut(idx - 1)
                             {
-                                *join_type = Some(JoinType::Inner);
+                                full_recompute_tables.insert(tbl_name.clone());
                             };
 
                             // Remove all custom INDEXED BY clauses for the table as the most efficient
@@ -850,7 +866,7 @@ impl Matcher {
 
         // metrics counters
         let mut counter_map = HashMap::new();
-        for table in parsed.table_columns.keys() {
+        for table in reactive_table_columns.keys() {
             counter_map.insert(table.clone(), HandleMetrics{
                 matched_count: counter!("corro.subs.changes.matched.count", "sql_hash" => sql_hash.clone(), "table" => table.to_string()),
             });
@@ -867,6 +883,7 @@ impl Matcher {
                     .create_pool()
                     .expect("could not build pool, this can't fail because we specified a runtime"),
                 parsed: parsed.clone(),
+                reactive_table_columns: reactive_table_columns.clone(),
                 col_names: col_names.clone(),
                 cancel: cancel.clone(),
                 last_change_rx,
@@ -892,6 +909,8 @@ impl Matcher {
             cached_statements: statements,
             pks,
             parsed,
+            reactive_table_columns,
+            full_recompute_tables,
             evt_tx,
             col_names,
             last_rowid: 0,
@@ -1071,7 +1090,7 @@ impl Matcher {
             }
             trace!("created query indexes");
 
-            for (table, columns) in matcher.parsed.table_columns.iter() {
+            for (table, columns) in matcher.reactive_table_columns.iter() {
                 tx.execute(
                     r#"INSERT INTO columns ("table", cid) VALUES (?, '-1')"#,
                     [table.as_str()],
@@ -1531,51 +1550,61 @@ impl Matcher {
             return Ok(());
         }
 
+        let full_recompute_table = candidates
+            .keys()
+            .find(|table| self.full_recompute_tables.contains(table.as_str()))
+            .cloned();
+
         trace!(
             "got some candidates! {:?}",
             candidates.keys().collect::<Vec<_>>()
         );
 
-        let tx = self.conn.transaction()?;
-        for (table, pks) in candidates {
-            let pks = pks
-                .iter()
-                .map(|(pk, _)| unpack_columns(pk))
-                .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
+        if let Some(table) = &full_recompute_table {
+            tables.insert(table.clone());
+        } else {
+            let tx = self.conn.transaction()?;
+            for (table, pks) in candidates {
+                let pks = pks
+                    .iter()
+                    .map(|(pk, _)| unpack_columns(pk))
+                    .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
 
-            let tmp_table_name = format!("temp_{table}");
-            if tables.insert(table.clone()) {
-                // create a temporary table to mix and match the data
-                tx.prepare_cached(
-                    // TODO: cache the statement's string somewhere, it's always the same!
-                    // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
-                    //       from the state db
-                    &format!(
-                        "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
-                        self.pks
-                            .get(table.as_str())
-                            .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                            .to_vec()
+                let tmp_table_name = format!("temp_{table}");
+                if tables.insert(table.clone()) {
+                    // create a temporary table to mix and match the data
+                    tx.prepare_cached(
+                        // TODO: cache the statement's string somewhere, it's always the same!
+                        // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
+                        //       from the state db
+                        &format!(
+                            "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
+                            self.pks
+                                .get(table.as_str())
+                                .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
+                                .to_vec()
+                                .join(",")
+                        ),
+                    )?
+                    .execute(())?;
+                }
+
+                for pks in pks {
+                    tx.prepare_cached(&format!(
+                        "INSERT INTO {tmp_table_name} VALUES ({})",
+                        (0..pks.len())
+                            .map(|_i| "coalesce(?, \"\")")
+                            .collect::<Vec<_>>()
                             .join(",")
-                    ),
-                )?
-                .execute(())?;
+                    ))?
+                    .execute(params_from_iter(pks))?;
+                }
             }
 
-            for pks in pks {
-                tx.prepare_cached(&format!(
-                    "INSERT INTO {tmp_table_name} VALUES ({})",
-                    (0..pks.len())
-                        .map(|_i| "coalesce(?, \"\")")
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ))?
-                .execute(params_from_iter(pks))?;
-            }
+            // commit so the temporary PK tables are visible to the state connection
+            tx.commit()?;
+            trace!("committed temp pk tables");
         }
-        // commit so it is visible to the other db!
-        tx.commit()?;
-        trace!("committed temp pk tables");
 
         let mut query_cols = vec![];
 
@@ -1592,6 +1621,22 @@ impl Matcher {
             all_cols.push(col_name.clone());
             query_cols.push(col_name);
         }
+
+        let full_recompute_stmt = full_recompute_table.as_ref().map(|table| {
+            let mut new_query = Cmd::Stmt(self.query.clone()).to_string();
+            new_query.pop();
+
+            debug!(
+                sub_id = %self.id,
+                %table,
+                "fully recomputing subscription for child dependency"
+            );
+
+            MatcherStmt {
+                new_query,
+                temp_query: format!("SELECT {} FROM query", all_cols.join(",")),
+            }
+        });
 
         // start a new tx
         let tx = self.conn.transaction()?;
@@ -1617,12 +1662,15 @@ impl Matcher {
 
             for table in tables.iter() {
                 let start = Instant::now();
-                let stmt = match self.cached_statements.get(table.as_str()) {
+                let stmt = match &full_recompute_stmt {
                     Some(stmt) => stmt,
-                    None => {
-                        warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
-                        continue;
-                    }
+                    None => match self.cached_statements.get(table.as_str()) {
+                        Some(stmt) => stmt,
+                        None => {
+                            warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
+                            continue;
+                        }
+                    },
                 };
 
                 trace!("SELECT SQL: {}", stmt.new_query);
@@ -1775,12 +1823,14 @@ impl Matcher {
                 histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => table.0.to_string()).record(elapsed);
             }
 
-            // clean up temporary tables immediately
-            for table in tables {
-                // TODO: reduce mistakes by computing this table name once
-                tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
-                    .execute(())?;
-                trace!("cleaned up temp_{table}");
+            if full_recompute_stmt.is_none() {
+                // clean up temporary tables immediately
+                for table in tables {
+                    // TODO: reduce mistakes by computing this table name once
+                    tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
+                        .execute(())?;
+                    trace!("cleaned up temp_{table}");
+                }
             }
         }
 
@@ -1848,9 +1898,65 @@ fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
 #[derive(Debug, Default, Clone)]
 pub struct ParsedSelect {
     table_columns: IndexMap<String, HashSet<String>>,
+    local_tables: HashSet<String>,
     aliases: HashMap<String, String>,
     pub columns: Vec<ResultColumn>,
     children: Vec<ParsedSelect>,
+}
+
+impl ParsedSelect {
+    fn subquery_trigger_tables(&self, schema: &Schema) -> IndexSet<String> {
+        let mut tables = IndexSet::new();
+
+        for child in &self.children {
+            child.collect_trigger_tables(schema, &mut tables);
+        }
+
+        tables
+    }
+
+    fn collect_trigger_tables(&self, schema: &Schema, tables: &mut IndexSet<String>) {
+        for table in &self.local_tables {
+            if schema.tables.contains_key(table) {
+                tables.insert(table.clone());
+            }
+        }
+
+        for child in &self.children {
+            child.collect_trigger_tables(schema, tables);
+        }
+    }
+
+    fn subquery_table_columns(&self, schema: &Schema) -> IndexMap<String, HashSet<String>> {
+        let mut table_columns = IndexMap::new();
+
+        for child in &self.children {
+            child.collect_table_columns(schema, &mut table_columns);
+        }
+
+        table_columns
+    }
+
+    fn collect_table_columns(
+        &self,
+        schema: &Schema,
+        table_columns: &mut IndexMap<String, HashSet<String>>,
+    ) {
+        for (table, columns) in &self.table_columns {
+            // Unaliased correlated outer references are schema-table entries too.
+            // They contribute reactive columns but not full-recompute triggers.
+            if schema.tables.contains_key(table) {
+                table_columns
+                    .entry(table.clone())
+                    .or_default()
+                    .extend(columns.iter().cloned());
+            }
+        }
+
+        for child in &self.children {
+            child.collect_table_columns(schema, table_columns);
+        }
+    }
 }
 
 fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSelect, MatcherError> {
@@ -1870,10 +1976,17 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
                         SelectTable::Table(name, alias, _) => {
                             if schema.tables.contains_key(name.name.0.as_str()) {
                                 if let Some(As::As(alias) | As::Elided(alias)) = alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    parsed.aliases.insert(
+                                        unquote(&alias.0).unwrap_or_else(|_| alias.0.clone()),
+                                        name.name.0.clone(),
+                                    );
                                 } else if let Some(ref alias) = name.alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    parsed.aliases.insert(
+                                        unquote(&alias.0).unwrap_or_else(|_| alias.0.clone()),
+                                        name.name.0.clone(),
+                                    );
                                 }
+                                parsed.local_tables.insert(name.name.0.clone());
                                 parsed.table_columns.entry(name.name.0.clone()).or_default();
                                 Some(&name.name)
                             } else {
@@ -1901,10 +2014,17 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
                         let tbl_name = match &join.table {
                             SelectTable::Table(name, alias, _) => {
                                 if let Some(As::As(alias) | As::Elided(alias)) = alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    parsed.aliases.insert(
+                                        unquote(&alias.0).unwrap_or_else(|_| alias.0.clone()),
+                                        name.name.0.clone(),
+                                    );
                                 } else if let Some(ref alias) = name.alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
+                                    parsed.aliases.insert(
+                                        unquote(&alias.0).unwrap_or_else(|_| alias.0.clone()),
+                                        name.name.0.clone(),
+                                    );
                                 }
+                                parsed.local_tables.insert(name.name.0.clone());
                                 parsed.table_columns.entry(name.name.0.clone()).or_default();
                                 &name.name
                             }
@@ -1962,6 +2082,18 @@ fn insert_col(set: &mut HashSet<String>, schema: &Schema, tbl_name: &str, name: 
     }
 }
 
+fn resolve_table_qualifier(tblname: &Name, parsed: &ParsedSelect) -> String {
+    let table_name = unquote(&tblname.0)
+        .ok()
+        .unwrap_or_else(|| tblname.0.clone());
+    parsed
+        .aliases
+        .get(&table_name)
+        .or_else(|| parsed.aliases.get(&tblname.0))
+        .cloned()
+        .unwrap_or(table_name)
+}
+
 fn extract_expr_columns(
     expr: &Expr,
     schema: &Schema,
@@ -1970,31 +2102,25 @@ fn extract_expr_columns(
     match expr {
         // simplest case
         Expr::Qualified(tblname, colname) => {
-            let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
+            let resolved_name = resolve_table_qualifier(tblname, parsed);
+            let colname = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
             // println!("adding column: {resolved_name} => {colname:?}");
-            insert_col(
-                parsed
-                    .table_columns
-                    .entry(resolved_name.clone())
-                    .or_default(),
-                schema,
-                resolved_name,
-                &colname.0,
-            );
+            let columns = parsed
+                .table_columns
+                .entry(resolved_name.clone())
+                .or_default();
+            insert_col(columns, schema, &resolved_name, &colname);
         }
         // simplest case but also mentioning the schema
         Expr::DoublyQualified(schema_name, tblname, colname) if schema_name.0 == "main" => {
-            let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
+            let resolved_name = resolve_table_qualifier(tblname, parsed);
+            let colname = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
             // println!("adding column: {resolved_name} => {colname:?}");
-            insert_col(
-                parsed
-                    .table_columns
-                    .entry(resolved_name.clone())
-                    .or_default(),
-                schema,
-                resolved_name,
-                &colname.0,
-            );
+            let columns = parsed
+                .table_columns
+                .entry(resolved_name.clone())
+                .or_default();
+            insert_col(columns, schema, &resolved_name, &colname);
         }
 
         Expr::Name(colname) => {
@@ -2050,7 +2176,7 @@ fn extract_expr_columns(
                     parsed.table_columns.entry(found.to_owned()).or_default(),
                     schema,
                     found,
-                    &colname.0,
+                    &check_col_name,
                 );
             } else {
                 if colname.0.starts_with('"') {
@@ -2189,11 +2315,8 @@ fn extract_columns(
                 }
             }
             ResultColumn::TableStar(tbl_name) => {
-                let name = parsed
-                    .aliases
-                    .get(tbl_name.0.as_str())
-                    .unwrap_or(&tbl_name.0);
-                if let Some(table) = schema.tables.get(name) {
+                let name = resolve_table_qualifier(tbl_name, parsed);
+                if let Some(table) = schema.tables.get(&name) {
                     let entry = parsed.table_columns.entry(table.name.clone()).or_default();
                     for col in table.columns.keys() {
                         entry.insert(col.clone());
@@ -2570,6 +2693,265 @@ mod tests {
                 .collect();
             assert_eq!(cols, unpacked);
         }
+    }
+
+    #[test]
+    fn test_quoted_column_identifiers_are_normalized() {
+        let schema = parse_sql(
+            "CREATE TABLE widgets (\
+                pk TEXT NOT NULL PRIMARY KEY,\
+                value TEXT,\
+                generated_value TEXT GENERATED ALWAYS AS (upper(value)) STORED\
+            );",
+        )
+        .unwrap();
+        let expected = HashSet::from(["value".to_owned()]);
+        let mut failures = Vec::new();
+
+        for (case, sql) in [
+            ("unquoted", "SELECT value FROM widgets"),
+            ("quoted", "SELECT \"value\" FROM widgets"),
+            ("qualified", "SELECT widgets.\"value\" FROM widgets"),
+            (
+                "doubly qualified",
+                "SELECT main.widgets.\"value\" FROM widgets",
+            ),
+            ("alias", "SELECT w.\"value\" FROM widgets AS w"),
+            (
+                "unquoted generated column",
+                "SELECT generated_value FROM widgets",
+            ),
+            (
+                "quoted generated column",
+                "SELECT \"generated_value\" FROM widgets",
+            ),
+        ] {
+            let mut parser = Parser::new(sql.as_bytes());
+            let cmd = parser.next().unwrap().unwrap();
+            let Cmd::Stmt(Stmt::Select(select)) = cmd else {
+                panic!("{case}: expected SELECT, got {cmd:?}");
+            };
+            let parsed = extract_select_columns(&select, &schema).unwrap();
+
+            let actual = parsed.table_columns.get("widgets");
+            if actual != Some(&expected) {
+                failures.push(format!("{case}: {sql}: {actual:?}"));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "incorrect normalized columns:\n{}",
+            failures.join("\n"),
+        );
+    }
+
+    fn is_change(event: &Option<QueryEvent>, typ: ChangeType, value: &str) -> bool {
+        matches!(
+            event,
+            Some(QueryEvent::Change(
+                actual_typ,
+                _,
+                cells,
+                _,
+            )) if *actual_typ == typ && cells == &[SqliteValue::Text(value.into())]
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_quoted_column_subscriptions_receive_changes() {
+        struct SubscriptionCase {
+            name: &'static str,
+            sql: &'static str,
+            generated: bool,
+            matcher: MatcherHandle,
+            rx: mpsc::Receiver<QueryEvent>,
+            events: Vec<Option<QueryEvent>>,
+        }
+
+        let specs = [
+            ("unquoted", "SELECT value FROM widgets", false),
+            ("quoted", "SELECT \"value\" FROM widgets", false),
+            ("qualified", "SELECT widgets.\"value\" FROM widgets", false),
+            (
+                "doubly qualified",
+                "SELECT main.widgets.\"value\" FROM widgets",
+                false,
+            ),
+            ("unquoted alias", "SELECT w.value FROM widgets AS w", false),
+            (
+                "quoted alias",
+                "SELECT w.\"value\" FROM widgets AS w",
+                false,
+            ),
+            (
+                "unquoted generated column",
+                "SELECT generated_value FROM widgets",
+                true,
+            ),
+            (
+                "quoted generated column",
+                "SELECT \"generated_value\" FROM widgets",
+                true,
+            ),
+        ];
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let schema_sql = "CREATE TABLE widgets (\
+            pk TEXT NOT NULL PRIMARY KEY,\
+            value TEXT,\
+            generated_value TEXT GENERATED ALWAYS AS (upper(value)) STORED\
+        );";
+        let mut schema = parse_sql(schema_sql).unwrap();
+        let subs = SubsManager::default();
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
+        let db_path = tmpdir.path().join("test.db");
+        let subscriptions_path: Utf8PathBuf =
+            tmpdir.path().join("subs").display().to_string().into();
+        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), -1048576)
+            .await
+            .unwrap();
+        let clock = Arc::new(uhlc::HLC::default());
+        let mut conn = pool.write_priority().await.unwrap();
+
+        setup_conn(&conn).unwrap();
+        migrate(clock, &mut conn).unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO widgets (pk, value) VALUES ('existing', 'before')",
+                (),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let mut cases = Vec::new();
+        for (name, sql, generated) in specs {
+            let (matcher, created) = subs
+                .get_or_insert(
+                    sql,
+                    subscriptions_path.as_path(),
+                    &schema,
+                    &pool,
+                    tripwire.clone(),
+                )
+                .unwrap();
+            let mut rx = created.unwrap().evt_rx;
+            assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
+            assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Row(..)));
+            assert!(matches!(
+                rx.recv().await.unwrap(),
+                QueryEvent::EndOfQuery { .. }
+            ));
+            cases.push(SubscriptionCase {
+                name,
+                sql,
+                generated,
+                matcher,
+                rx,
+                events: Vec::new(),
+            });
+        }
+
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "UPDATE widgets SET value = 'after' WHERE pk = 'existing'",
+                (),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        for case in &cases {
+            filter_changes_from_db(&case.matcher, &conn, None, CrsqlDbVersion(2)).unwrap();
+        }
+        for case in &mut cases {
+            case.events.push(
+                tokio::time::timeout(Duration::from_secs(3), case.rx.recv())
+                    .await
+                    .ok()
+                    .flatten(),
+            );
+        }
+
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO widgets (pk, value) VALUES ('inserted', 'new')",
+                (),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        for case in &cases {
+            filter_changes_from_db(&case.matcher, &conn, None, CrsqlDbVersion(3)).unwrap();
+        }
+        for case in &mut cases {
+            case.events.push(
+                tokio::time::timeout(Duration::from_secs(3), case.rx.recv())
+                    .await
+                    .ok()
+                    .flatten(),
+            );
+        }
+
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute("DELETE FROM widgets WHERE pk = 'existing'", ())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        for case in &cases {
+            filter_changes_from_db(&case.matcher, &conn, None, CrsqlDbVersion(4)).unwrap();
+        }
+        for case in &mut cases {
+            case.events.push(
+                tokio::time::timeout(Duration::from_secs(3), case.rx.recv())
+                    .await
+                    .ok()
+                    .flatten(),
+            );
+        }
+
+        let mut failures = Vec::new();
+        for case in &cases {
+            let (updated, inserted, deleted) = if case.generated {
+                ("AFTER", "NEW", "AFTER")
+            } else {
+                ("after", "new", "after")
+            };
+
+            if !is_change(&case.events[0], ChangeType::Update, updated)
+                || !is_change(&case.events[1], ChangeType::Insert, inserted)
+                || !is_change(&case.events[2], ChangeType::Delete, deleted)
+            {
+                failures.push(format!("{}: {}: {:?}", case.name, case.sql, case.events));
+            }
+        }
+
+        for case in &cases {
+            case.matcher.cleanup().await;
+            subs.remove(&case.matcher.id());
+        }
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+        drop(cases);
+        drop(conn);
+        // SplitPool's dispatcher assumes at least one request sender remains. Keep
+        // this test-only pool alive while its Tokio runtime is active.
+        std::mem::forget(pool);
+
+        assert!(
+            failures.is_empty(),
+            "incorrect subscription changes:\n{}",
+            failures.join("\n"),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -3178,6 +3560,250 @@ mod tests {
             let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
             assert!(res.is_err());
         }
+    }
+
+    #[test]
+    fn quoted_table_qualifiers_create_matchers() {
+        let schema_sql = "CREATE TABLE sw (pk TEXT NOT NULL PRIMARY KEY, sandwich TEXT);";
+        let schema = parse_sql(schema_sql).unwrap();
+        let state_conn = Connection::open_in_memory().unwrap();
+        state_conn.execute_batch(schema_sql).unwrap();
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
+        let subscriptions_path: Utf8PathBuf =
+            tmpdir.path().join("subs").display().to_string().into();
+
+        for sql in [
+            "SELECT sandwich FROM sw WHERE sw.pk = 'mad'",
+            "SELECT sandwich FROM sw WHERE \"sw\".pk = 'mad'",
+            "SELECT sandwich FROM sw AS s WHERE \"s\".pk = 'mad'",
+            "SELECT sandwich FROM sw AS \"s\" WHERE \"s\".pk = 'mad'",
+            "SELECT sandwich FROM sw WHERE main.\"sw\".pk = 'mad'",
+            "SELECT \"sw\".\"sandwich\" FROM sw WHERE \"sw\".\"pk\" = 'mad'",
+        ] {
+            let id = Uuid::new_v4();
+            let (evt_tx, _evt_rx) = mpsc::channel(1);
+            let (matcher, handle) =
+                Matcher::new(id, &subscriptions_path, &schema, &state_conn, evt_tx, sql).unwrap();
+
+            assert_eq!(matcher.parsed.table_columns.len(), 1);
+            let expected = HashSet::from(["sandwich".to_owned(), "pk".to_owned()]);
+            assert_eq!(matcher.parsed.table_columns["sw"], expected);
+            assert_eq!(handle.inner.parsed.table_columns.len(), 1);
+            assert_eq!(handle.inner.parsed.table_columns["sw"], expected);
+        }
+    }
+
+    #[test]
+    fn unknown_table_qualifier_is_rejected() {
+        let schema = parse_sql("CREATE TABLE sw (pk TEXT NOT NULL PRIMARY KEY);").unwrap();
+        let state_conn = Connection::open_in_memory().unwrap();
+        state_conn
+            .execute_batch("CREATE TABLE sw (pk TEXT NOT NULL PRIMARY KEY);")
+            .unwrap();
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
+        let path: Utf8PathBuf = tmpdir.path().join("subs").display().to_string().into();
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(Matcher::new(
+            Uuid::new_v4(),
+            &path,
+            &schema,
+            &state_conn,
+            tx,
+            "SELECT pk FROM sw WHERE missing.pk='mad'"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn reconciliation_correlated_outer_alias_is_accepted() {
+        let schema_sql = "CREATE TABLE roots (id INTEGER NOT NULL PRIMARY KEY);\
+            CREATE TABLE children (id INTEGER NOT NULL PRIMARY KEY, root_id INTEGER);";
+        let schema = parse_sql(schema_sql).unwrap();
+        let state_conn = Connection::open_in_memory().unwrap();
+        state_conn.execute_batch(schema_sql).unwrap();
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
+        let path: Utf8PathBuf = tmpdir.path().join("subs").display().to_string().into();
+        let (tx, _rx) = mpsc::channel(1);
+        Matcher::new(Uuid::new_v4(), &path, &schema, &state_conn, tx,
+            "SELECT r.id FROM roots r WHERE NOT EXISTS (SELECT 1 FROM children c WHERE c.root_id=r.id)").unwrap();
+    }
+
+    #[test]
+    fn forward_table_qualifier_in_join_creates_matcher() {
+        let schema_sql = "CREATE TABLE a (pk TEXT NOT NULL PRIMARY KEY);\
+            CREATE TABLE b (pk TEXT NOT NULL PRIMARY KEY);\
+            CREATE TABLE c (pk TEXT NOT NULL PRIMARY KEY);";
+        let schema = parse_sql(schema_sql).unwrap();
+        let state_conn = Connection::open_in_memory().unwrap();
+        state_conn.execute_batch(schema_sql).unwrap();
+        state_conn
+            .execute_batch(
+                "INSERT INTO a VALUES ('one');\
+                 INSERT INTO b VALUES ('one');\
+                 INSERT INTO c VALUES ('one');",
+            )
+            .unwrap();
+        // SQLite permits an INNER JOIN predicate to reference a later table.
+        let sql = "SELECT a.pk FROM a JOIN b ON c.pk = b.pk JOIN c ON a.pk = c.pk";
+        let value: String = state_conn.query_row(sql, (), |row| row.get(0)).unwrap();
+        assert_eq!(value, "one");
+
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
+        let subscriptions_path: Utf8PathBuf =
+            tmpdir.path().join("subs").display().to_string().into();
+        let (evt_tx, _evt_rx) = mpsc::channel(1);
+        let (matcher, _) = Matcher::new(
+            Uuid::new_v4(),
+            &subscriptions_path,
+            &schema,
+            &state_conn,
+            evt_tx,
+            sql,
+        )
+        .unwrap();
+        assert_eq!(matcher.parsed.table_columns.len(), 3);
+        assert!(matcher.parsed.table_columns["c"].contains("pk"));
+    }
+
+    async fn reconciliation_scenario(sql: &str, projected_child: bool, one_to_one: bool) {
+        let schema_sql =
+            "CREATE TABLE roots (id INTEGER NOT NULL PRIMARY KEY, child_id INTEGER, value TEXT);\
+            CREATE TABLE children (id INTEGER NOT NULL PRIMARY KEY, root_id INTEGER, value TEXT);";
+        let mut schema = parse_sql(schema_sql).unwrap();
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
+        let db_path = tmpdir.path().join("test.db");
+        let subs_path: Utf8PathBuf = tmpdir.path().join("subs").display().to_string().into();
+        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), -1048576)
+            .await
+            .unwrap();
+        let mut conn = pool.write_priority().await.unwrap();
+        setup_conn(&conn).unwrap();
+        migrate(Arc::new(uhlc::HLC::default()), &mut conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
+        tx.execute("INSERT INTO roots VALUES (1, 10, 'before')", ())
+            .unwrap();
+        tx.commit().unwrap();
+        let (tripwire, worker, tripwire_tx) = Tripwire::new_simple();
+        let subs = SubsManager::default();
+        let (handle, created) = subs
+            .get_or_insert(sql, &subs_path, &schema, &pool, tripwire)
+            .unwrap();
+        let mut events = created.unwrap().evt_rx;
+        let mut visible = HashMap::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                QueryEvent::Row(id, cells) => {
+                    visible.insert(id.0, cells);
+                }
+                QueryEvent::EndOfQuery { .. } => break,
+                QueryEvent::Error(error) => panic!("{error}"),
+                _ => (),
+            }
+        }
+        let mut failures = Vec::new();
+        let mut steps = vec![
+            (
+                "INSERT INTO children VALUES (10, 1, 'child')",
+                Some("child"),
+            ),
+            ("DELETE FROM children WHERE id=10", None),
+            (
+                "INSERT INTO children VALUES (10, 1, 'again')",
+                Some("again"),
+            ),
+        ];
+        if one_to_one {
+            steps.push((
+                "INSERT INTO children VALUES (20, 1, 'other')",
+                Some("again"),
+            ));
+            steps.push(("UPDATE roots SET child_id=20 WHERE id=1", Some("other")));
+        }
+        for (statement, child_value) in steps {
+            let child_present = child_value.is_some();
+            conn.execute(statement, ()).unwrap();
+            let version = conn
+                .query_row("SELECT crsql_db_version()", (), |r| r.get(0))
+                .unwrap();
+            filter_changes_from_db(&handle, &conn, None, version).unwrap();
+            // Exercise the production candidate-buffer path, including no-op results.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    QueryEvent::Change(ChangeType::Delete, id, _, _) => {
+                        visible.remove(&id.0);
+                    }
+                    QueryEvent::Change(_, id, cells, _) => {
+                        visible.insert(id.0, cells);
+                    }
+                    QueryEvent::Error(error) => failures.push(error.to_string()),
+                    _ => (),
+                }
+            }
+            let expected = if projected_child {
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    if child_present {
+                        if one_to_one {
+                            SqliteValue::Text(child_value.unwrap().into())
+                        } else {
+                            SqliteValue::Integer(10)
+                        }
+                    } else {
+                        SqliteValue::Null
+                    },
+                ]]
+            } else if child_present {
+                vec![]
+            } else {
+                vec![vec![SqliteValue::Integer(1)]]
+            };
+            let actual = visible.values().cloned().collect::<Vec<_>>();
+            if actual != expected {
+                failures.push(format!("{statement}: {actual:?} != {expected:?}"));
+            }
+        }
+        handle.cleanup().await;
+        subs.remove(&handle.id());
+        tripwire_tx.send(()).await.ok();
+        worker.await;
+        wait_for_all_pending_handles().await;
+        drop(conn);
+        std::mem::forget(pool);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciliation_subquery_child_changes() {
+        reconciliation_scenario(
+            "SELECT r.id FROM roots r WHERE NOT EXISTS (SELECT 1 FROM children c WHERE c.root_id=r.id)",
+            false, false,
+        ).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciliation_left_join_partial_identities() {
+        reconciliation_scenario(
+            "SELECT r.id, c.id FROM roots r LEFT JOIN children c ON c.root_id=r.id",
+            true,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciliation_left_join_minimal_identity() {
+        reconciliation_scenario(
+            "SELECT r.id, c.value FROM roots r LEFT JOIN children c ON c.id=r.child_id",
+            true,
+            true,
+        )
+        .await;
     }
 
     fn filter_changes_from_db(
