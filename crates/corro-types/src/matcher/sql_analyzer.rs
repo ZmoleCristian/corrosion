@@ -124,10 +124,7 @@ pub struct ParsedSelect {
     pub group_by: Option<Vec<ReturnExpr>>,
     // The columns returned by this query
     pub result_columns: Vec<ReturnExpr>,
-    // Subqueries and stuff, currently mostly ignored
-    // They are included when querying for changes but not used for matching
-    // For ex. SELECT * FROM ... WHERE EXISTS (SELECT * FROM other_table WHERE ...)
-    // Will work as a filter but won't the subscription won't be reactive to changes in other_table
+    // Nested scopes contribute reactive columns and full-result invalidations.
     pub children: Vec<ParsedSelect>,
     // Where constrains always apply regardless of join nullability
     // Where constrains actually can infer a non nullable constraint
@@ -268,9 +265,9 @@ impl<'a> ParsingScope<'a> {
         let table_schema = table_schema.unwrap();
         // Assume that if we have no alias, the table name is the alias
         let resolved_alias = if let Some(As::As(alias) | As::Elided(alias)) = alias {
-            alias.0.clone()
+            unquote(&alias.0).unwrap_or_else(|_| alias.0.clone())
         } else if let Some(ref alias) = table_name.alias {
-            alias.0.clone()
+            unquote(&alias.0).unwrap_or_else(|_| alias.0.clone())
         } else {
             real_table_name.0.clone()
         };
@@ -333,6 +330,8 @@ impl<'a> ParsingScope<'a> {
         // If it's a double-quoted column name, let's unquote it
         // This also applies to qualified names. foo."id" is the same as foo.id
         let check_col_name = unquote(column_name).ok().unwrap_or(column_name.clone());
+        let namespace = namespace.map(|name| unquote(name).unwrap_or_else(|_| name.to_owned()));
+        let namespace = namespace.as_deref();
 
         // Look for the table in the current scope
         if let Some(namespace) = namespace {
@@ -1045,10 +1044,11 @@ impl<'a> ParsingScope<'a> {
                     }
                 }
                 ResultColumn::TableStar(tbl_name) => {
+                    let namespace = unquote(&tbl_name.0).unwrap_or_else(|_| tbl_name.0.clone());
                     let (table_def, table_schema, table_info) = self
                         .parsed
                         .table_by_alias
-                        .get(tbl_name.0.as_str())
+                        .get(namespace.as_str())
                         .and_then(|table_def| {
                             Some((
                                 table_def,
@@ -1220,8 +1220,33 @@ pub struct PreparedSubscriptionSql {
     pub(crate) result_set_with_pk: Vec<ReturnExpr>,
     // real_name -> real_table
     pub(crate) real_tables: IndexMap<String, RealTableMatcherStmt>,
+    // Includes nested scopes, which have no root-row PK mapping.
+    pub(crate) reactive_columns: IndexMap<String, HashSet<String>>,
+    pub(crate) full_recompute_tables: HashSet<String>,
     // alias -> query_table
     pub(crate) query_tables: IndexMap<String, QueryTableMatcherStmt>,
+}
+
+impl ParsedSelect {
+    fn collect_reactive_columns(
+        &self,
+        nested: bool,
+        columns: &mut IndexMap<String, HashSet<String>>,
+        full_recompute_tables: &mut HashSet<String>,
+    ) {
+        for (table, details) in &self.tables {
+            columns
+                .entry(table.real_table.clone())
+                .or_default()
+                .extend(details.columns.iter().cloned());
+            if nested || details.rhs_nullable {
+                full_recompute_tables.insert(table.real_table.clone());
+            }
+        }
+        for child in &self.children {
+            child.collect_reactive_columns(true, columns, full_recompute_tables);
+        }
+    }
 }
 
 impl PreparedSubscriptionSql {
@@ -1640,6 +1665,18 @@ pub fn prepare_subscription_sql(
         });
     }
 
+    let mut reactive_columns = IndexMap::new();
+    let mut full_recompute_tables = HashSet::new();
+    parsed.collect_reactive_columns(false, &mut reactive_columns, &mut full_recompute_tables);
+    // Ordinary CR-SQLite changes name non-PK columns. Key-only predicates still
+    // need a candidate when a row is inserted, even without a value dependency.
+    for (name, columns) in &mut reactive_columns {
+        let table = &schema.tables[name];
+        if columns.iter().all(|column| table.pk.contains(column)) {
+            columns.extend(table.columns.keys().cloned());
+        }
+    }
+
     Ok(PreparedSubscriptionSql {
         initial_query: stmt,
         pk: join_pk,
@@ -1650,6 +1687,8 @@ pub fn prepare_subscription_sql(
         parsed,
         query_tables,
         real_tables,
+        reactive_columns,
+        full_recompute_tables,
     })
 }
 

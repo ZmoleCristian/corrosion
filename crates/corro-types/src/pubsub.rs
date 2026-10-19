@@ -319,11 +319,10 @@ impl Handle for MatcherHandle {
         if !self
             .inner
             .prepared_subscription
-            .real_tables
+            .reactive_columns
             .get(change.table.as_str())
-            .map(|table_def| {
-                change.column.is_crsql_sentinel()
-                    || table_def.subscribed_cols.contains(change.column.as_str())
+            .map(|columns| {
+                change.column.is_crsql_sentinel() || columns.contains(change.column.as_str())
             })
             .unwrap_or_default()
         {
@@ -627,6 +626,8 @@ impl Matcher {
         };
 
         let prepared_subscription = prepare_subscription_sql(id, sql, schema)?;
+        // Reject an invalid rewritten query before creating a live stream.
+        conn.prepare(&Cmd::Stmt(prepared_subscription.initial_query.clone()).to_string())?;
 
         // This means we have an sqlite parser bug
         if col_names.len() != prepared_subscription.result_set.len() {
@@ -656,7 +657,7 @@ impl Matcher {
 
         // metrics counters
         let mut counter_map = HashMap::new();
-        for table in prepared_subscription.parsed.table_by_real_name.keys() {
+        for table in prepared_subscription.reactive_columns.keys() {
             counter_map.insert(table.clone(), HandleMetrics{
                 matched_count: counter!("corro.subs.changes.matched.count", "sql_hash" => sql_hash.clone(), "table" => table.to_string()),
             });
@@ -1291,9 +1292,14 @@ impl Matcher {
 
         let mut clean_pk_stmts = Vec::new();
         let mut affected_query_tables = Vec::new();
+        let full_recompute = candidates.keys().any(|table| {
+            self.prepared_subscription
+                .full_recompute_tables
+                .contains(table.as_str())
+        });
         let tx = self.conn.transaction()?;
         // Insert the affected pks into the temp tables
-        for (table_name, pks) in candidates {
+        for (table_name, pks) in candidates.into_iter().filter(|_| !full_recompute) {
             let real_table = self
                 .prepared_subscription
                 .real_tables
@@ -1335,40 +1341,102 @@ impl Matcher {
         }
         trace!("inserted temp pk tables");
 
+        let full_query = if full_recompute {
+            Cmd::Stmt(self.prepared_subscription.initial_query.clone()).to_string()
+        } else {
+            String::new()
+        };
+        let full_cached_query = if full_recompute {
+            format!(
+                "SELECT {} FROM query",
+                self.prepared_subscription.return_column_names_with_pks()
+            )
+        } else {
+            String::new()
+        };
+        let statements = if full_recompute {
+            vec![(
+                full_query.trim_end_matches(';'),
+                full_cached_query.as_str(),
+                "full",
+            )]
+        } else {
+            affected_query_tables
+                .iter()
+                .map(|table| {
+                    let query = &self.prepared_subscription.query_tables[&table.alias];
+                    (
+                        query.new_query.as_str(),
+                        query.temp_query.as_str(),
+                        table.real_table.as_str(),
+                    )
+                })
+                .collect()
+        };
+        // Match both sides within the same partial-index nullability domain.
+        let matching_row_ids = |source: &str| {
+            self.prepared_subscription
+                .identity_uniq_indexes
+                .iter()
+                .map(|index| {
+                    let predicate = index
+                        .filter_expr_sql()
+                        .map(|expr| format!("AND ({expr})"))
+                        .unwrap_or_default();
+                    format!(
+                        "SELECT __corro_rowid FROM query WHERE ({keys}) IN \
+                    (SELECT {keys} FROM {source} WHERE 1 {predicate}) {predicate}",
+                        keys = index.index_columns_sql()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" UNION ")
+        };
         let mut new_last_rowid = self.last_rowid;
         {
-            for table_def in &affected_query_tables {
+            for (new_query, temp_query, metric_table) in statements {
                 let start: Instant = Instant::now();
-                let query_table = self
-                    .prepared_subscription
-                    .query_tables
-                    .get(&table_def.alias)
-                    .unwrap();
 
                 let sql = format!(
                     "WITH change_batch AS ({})
                     INSERT INTO state_results SELECT * FROM change_batch ",
-                    query_table.new_query,
+                    new_query,
                 );
                 trace!("SELECT SQL: {}", sql);
                 tx.prepare_cached(&sql)?.execute([])?;
 
+                // Capture only matching identities. Hidden-key maintenance does
+                // not emit an UPDATE if the visible cells remain unchanged.
+                let previous_visible_rows = {
+                    let mut stmt = tx.prepare(&format!(
+                        "SELECT __corro_rowid,{} FROM query WHERE __corro_rowid IN ({})",
+                        self.prepared_subscription.return_column_names(),
+                        matching_row_ids("state_results"),
+                    ))?;
+                    let col_count = stmt.column_count();
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            (1..col_count)
+                                .map(|i| row.get::<_, SqliteValue>(i))
+                                .collect::<Result<Vec<_>, _>>()?,
+                        ))
+                    })?;
+                    rows.collect::<Result<HashMap<_, _>, _>>()?
+                };
+                let upsert_columns = &self.prepared_subscription.result_set_with_pk;
                 let upsert_body = format!(
                     "
                         DO UPDATE SET
                             {excluded}
                         WHERE {excluded_not_same}
                     ",
-                    excluded = self
-                        .prepared_subscription
-                        .result_set
+                    excluded = upsert_columns
                         .iter()
                         .map(|x| format!("{col_name} = excluded.{col_name}", col_name = x.alias))
                         .collect::<Vec<_>>()
                         .join(","),
-                    excluded_not_same = self
-                        .prepared_subscription
-                        .result_set
+                    excluded_not_same = upsert_columns
                         .iter()
                         .map(|x| format!(
                             "{col_name} IS NOT excluded.{col_name}",
@@ -1409,7 +1477,7 @@ impl Matcher {
                         RETURNING __corro_rowid,{return_cols}",
                     // insert into
                     insert_cols = self.prepared_subscription.return_column_names_with_pks(),
-                    query_query = query_table.temp_query,
+                    query_query = temp_query,
                     multi_upsert = multi_upsert,
                     return_cols = self.prepared_subscription.return_column_names()
                 );
@@ -1418,52 +1486,20 @@ impl Matcher {
 
                 let insert_prepped = tx.prepare_cached(&sql)?;
 
-                // Build the CTE branches for each partial index
-                let cte_branches: Vec<String> = self
-                    .prepared_subscription
-                    .identity_uniq_indexes
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, def)| {
-                        let where_clause = def
-                            .filter_expr_sql()
-                            .map(|f| format!("AND ({f})"))
-                            .unwrap_or_default();
-
-                        format!(
-                            "deleted_{idx} AS (
-                            SELECT __corro_rowid FROM query
-                            WHERE ({pks}) IN (SELECT {pks} FROM rows_which_dissapeared)
-                            {where_clause}
-                        )",
-                            idx = idx,
-                            pks = def.index_columns_sql(),
-                            where_clause = where_clause
-                        )
-                    })
-                    .collect();
-
-                // Build the UNION of all rowids
-                let union_selects: Vec<String> = (0..cte_branches.len())
-                    .map(|idx| format!("SELECT __corro_rowid FROM deleted_{idx}"))
-                    .collect();
-
                 let sql = format!(
                     "
                     WITH rows_which_dissapeared AS (
                         {query_query}
                         EXCEPT
                         SELECT * FROM state_results
-                    ),
-                    {cte_branches}
+                    )
                     DELETE FROM query 
                     WHERE __corro_rowid IN (
                         {union_selects}
                     ) RETURNING __corro_rowid,{return_cols}
                 ",
-                    cte_branches = cte_branches.join(",\n        "),
-                    union_selects = union_selects.join("\n        UNION ALL\n        "),
-                    query_query = query_table.temp_query,
+                    union_selects = matching_row_ids("rows_which_dissapeared"),
+                    query_query = temp_query,
                     return_cols = self.prepared_subscription.return_column_names()
                 );
 
@@ -1506,6 +1542,11 @@ impl Matcher {
                             .collect::<rusqlite::Result<Vec<_>>>()
                         {
                             Ok(cells) => {
+                                if change_type == ChangeType::Update
+                                    && previous_visible_rows.get(&rowid.0) == Some(&cells)
+                                {
+                                    continue;
+                                }
                                 change_insert_stmt.raw_bind_parameter(1, rowid)?;
                                 change_insert_stmt.raw_bind_parameter(2, change_type)?;
                                 for (i, cell) in cells.iter().enumerate() {
@@ -1546,7 +1587,7 @@ impl Matcher {
                 tx.execute_batch("DELETE FROM state_results")?;
 
                 let elapsed = start.elapsed();
-                histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => table_def.real_table.clone()).record(elapsed);
+                histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => metric_table.to_owned()).record(elapsed);
             }
 
             // Clean the PK tables
@@ -2561,5 +2602,161 @@ mod tests {
             error!(sub_id = %matcher.inner.id, "could not send candidates to matcher: {e}");
         }
         Ok(())
+    }
+
+    async fn reconciliation_scenario(sql: &str, projected_child: bool, one_to_one: bool) {
+        let schema_sql =
+            "CREATE TABLE roots (id INTEGER NOT NULL PRIMARY KEY, child_id INTEGER, value TEXT);\
+            CREATE TABLE children (id INTEGER NOT NULL PRIMARY KEY, root_id INTEGER, value TEXT);";
+        let mut schema = parse_sql(schema_sql).unwrap();
+        let tmpdir = TempDir::new(tempfile::tempdir().unwrap());
+        let db_path = tmpdir.path().join("test.db");
+        let subs_path: Utf8PathBuf = tmpdir.path().join("subs").display().to_string().into();
+        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), -1048576)
+            .await
+            .unwrap();
+        let mut conn = pool.write_priority().await.unwrap();
+        setup_conn(&conn).unwrap();
+        migrate(Arc::new(uhlc::HLC::default()), &mut conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
+        tx.execute("INSERT INTO roots VALUES (1, 10, 'before')", ())
+            .unwrap();
+        tx.commit().unwrap();
+        let (tripwire, worker, tripwire_tx) = Tripwire::new_simple();
+        let subs = SubsManager::default();
+        let (handle, created) = subs
+            .get_or_insert(sql, &subs_path, &schema, &pool, tripwire)
+            .unwrap();
+        let mut events = created.unwrap().evt_rx;
+        let mut visible = HashMap::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                QueryEvent::Row(id, cells) => {
+                    visible.insert(id.0, cells);
+                }
+                QueryEvent::EndOfQuery { .. } => break,
+                QueryEvent::Error(error) => panic!("{error}"),
+                _ => (),
+            }
+        }
+        let mut failures = Vec::new();
+        let mut steps = vec![
+            (
+                "INSERT INTO children VALUES (10, 1, 'child')",
+                Some("child"),
+            ),
+            ("DELETE FROM children WHERE id=10", None),
+            (
+                "INSERT INTO children VALUES (10, 1, 'again')",
+                Some("again"),
+            ),
+        ];
+        if one_to_one {
+            steps.push((
+                "INSERT INTO children VALUES (20, 1, 'other')",
+                Some("again"),
+            ));
+            steps.push(("UPDATE roots SET child_id=20 WHERE id=1", Some("other")));
+        }
+        for (statement, child_value) in steps {
+            let child_present = child_value.is_some();
+            conn.execute(statement, ()).unwrap();
+            let version = conn
+                .query_row("SELECT crsql_db_version()", (), |r| r.get(0))
+                .unwrap();
+            filter_changes_from_db(&handle, &conn, None, version).unwrap();
+            // Exercise the production candidate-buffer path, including no-op results.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    QueryEvent::Change(ChangeType::Delete, id, _, _) => {
+                        visible.remove(&id.0);
+                    }
+                    QueryEvent::Change(_, id, cells, _) => {
+                        visible.insert(id.0, cells);
+                    }
+                    QueryEvent::Error(error) => failures.push(error.to_string()),
+                    _ => (),
+                }
+            }
+            let expected = if projected_child {
+                vec![vec![
+                    SqliteValue::Integer(1),
+                    if child_present {
+                        if one_to_one {
+                            SqliteValue::Text(child_value.unwrap().into())
+                        } else {
+                            SqliteValue::Integer(10)
+                        }
+                    } else {
+                        SqliteValue::Null
+                    },
+                ]]
+            } else if child_present {
+                vec![]
+            } else {
+                vec![vec![SqliteValue::Integer(1)]]
+            };
+            let actual = visible.values().cloned().collect::<Vec<_>>();
+            if actual != expected {
+                failures.push(format!("{statement}: {actual:?} != {expected:?}"));
+            }
+        }
+        handle.cleanup().await;
+        subs.remove(&handle.id());
+        tripwire_tx.send(()).await.ok();
+        worker.await;
+        wait_for_all_pending_handles().await;
+        drop(conn);
+        std::mem::forget(pool);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciliation_subquery_child_changes() {
+        reconciliation_scenario(
+            "SELECT r.id FROM roots r WHERE NOT EXISTS (SELECT 1 FROM children c WHERE c.root_id=r.id)",
+            false, false,
+        ).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciliation_left_join_partial_identities() {
+        reconciliation_scenario(
+            "SELECT r.id, c.id FROM roots r LEFT JOIN children c ON c.root_id=r.id",
+            true,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconciliation_left_join_minimal_identity() {
+        reconciliation_scenario(
+            "SELECT r.id, c.value FROM roots r LEFT JOIN children c ON c.id=r.child_id",
+            true,
+            true,
+        )
+        .await;
+    }
+
+    #[test]
+    fn reconciliation_quoted_qualifiers() {
+        let schema =
+            parse_sql("CREATE TABLE sw (pk TEXT NOT NULL PRIMARY KEY, value TEXT);").unwrap();
+        for sql in [
+            "SELECT value FROM sw WHERE \"sw\".pk='one'",
+            "SELECT value FROM sw s WHERE \"s\".pk='one'",
+            "SELECT \"s\".\"value\" FROM sw AS \"s\" WHERE \"s\".pk='one'",
+            "SELECT value FROM sw WHERE main.\"sw\".pk='one'",
+            "SELECT \"s\".* FROM sw AS \"s\"",
+        ] {
+            prepare_subscription_sql(Uuid::new_v4(), sql, &schema).unwrap();
+        }
     }
 }
