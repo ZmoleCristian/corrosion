@@ -581,6 +581,47 @@ async fn test_information_schema() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_committed_dispatch_ignores_temp_change_view() {
+    use corro_types::{api::NotifyEvent, pubsub::ChangeType};
+    let (tripwire, worker, shutdown) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire.clone(), None).await;
+    let (_handle, created) = ta
+        .agent
+        .updates_manager()
+        .get_or_insert(
+            "kitchensink",
+            &ta.agent.schema().read(),
+            ta.agent.pool(),
+            tripwire,
+        )
+        .unwrap();
+    let mut updates = created.unwrap().evt_rx;
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(connection);
+    // Bookkeeping can read this projection, but full change extraction must use
+    // the main database rather than the session's temporary schema.
+    client.batch_execute("CREATE TEMP VIEW crsql_changes AS SELECT seq, ts, site_id, db_version FROM main.crsql_changes").await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (301)", &[])
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), updates.recv())
+            .await.expect("committed dispatch must ignore the temporary change view")
+            .expect("updates channel closed"),
+        NotifyEvent::Notify(ChangeType::Update, pks) if pks == vec![301_i64.into()]
+    ));
+    drop(client);
+    shutdown.send(()).await.ok();
+    worker.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
