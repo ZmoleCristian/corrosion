@@ -800,6 +800,61 @@ async fn test_pg() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_committed_dispatch_does_not_wait_for_readers() {
+    use corro_types::{api::NotifyEvent, pubsub::ChangeType};
+
+    let (tripwire, worker, shutdown) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire.clone(), None).await;
+    let (_handle, created) = ta
+        .agent
+        .updates_manager()
+        .get_or_insert(
+            "kitchensink",
+            &ta.agent.schema().read(),
+            ta.agent.pool(),
+            tripwire,
+        )
+        .unwrap();
+    let mut updates = created.unwrap().evt_rx;
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(connection);
+
+    let mut readers = Vec::new();
+    for _ in 0..20 {
+        readers.push(ta.agent.pool().read().await.unwrap());
+    }
+    // Exercise implicit and explicit transaction finalization on the PG socket.
+    for (id, explicit) in [(1_i64, false), (2, true)] {
+        if explicit {
+            client.batch_execute("BEGIN").await.unwrap();
+        }
+        client
+            .execute("INSERT INTO kitchensink (id) VALUES ($1)", &[&id])
+            .await
+            .unwrap();
+        if explicit {
+            client.batch_execute("COMMIT").await.unwrap();
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), updates.recv())
+                .await
+                .expect("PG commit must notify while the shared readers are occupied")
+                .expect("updates channel closed"),
+            NotifyEvent::Notify(ChangeType::Update, pks) if pks == vec![id.into()]
+        ));
+    }
+    drop(readers);
+    drop(client);
+    shutdown.send(()).await.ok();
+    worker.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg_transaction_errors() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let (_ta, server) = setup_pg_test_server(tripwire, None).await;

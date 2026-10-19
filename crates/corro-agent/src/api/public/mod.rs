@@ -30,7 +30,6 @@ use hyper::StatusCode;
 use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
-use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
 
 use tokio::{
@@ -132,11 +131,11 @@ where
 
                 book_writer.commit();
 
-                let agent = agent.clone();
-
-                spawn_counted(
-                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
-                );
+                // The transaction is committed, so report extraction errors without
+                // making the client retry an already successful write.
+                if let Err(error) = broadcast_changes(agent, &conn, db_version, last_seq, ts) {
+                    error!(%db_version, %error, "could not dispatch committed changes");
+                }
 
                 Ok::<_, ChangeError>((ret, Some(db_version), elapsed))
             }
@@ -759,6 +758,128 @@ mod tests {
         // no actual changes!
         assert!(matches!(rx_bcast.try_recv(), Err(TryRecvError::Empty)));
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_dispatch_does_not_wait_for_query_readers() -> eyre::Result<()> {
+        use corro_types::{api::NotifyEvent, pubsub::ChangeType};
+
+        let (tripwire, _worker, _shutdown) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+        let (agent, mut options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .broadcast_method(BroadcastMethod::Plumtree)
+                .build()?,
+            tripwire.clone(),
+        )
+        .await?;
+        execute_schema(
+            &agent,
+            vec![
+                corro_tests::TEST_SCHEMA.to_owned(),
+                "CREATE TABLE exports (id INTEGER NOT NULL PRIMARY KEY, payload TEXT NOT NULL DEFAULT '')".into(),
+            ],
+        )
+        .await?;
+        let (status, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            Query(TimeoutParams::default()),
+            axum::Json(vec![Statement::Simple(
+                "WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<1024)
+                 INSERT INTO exports SELECT id, 'payload' FROM ids"
+                    .into(),
+            )]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0.version, Some(1));
+
+        let (_handle, created) = agent.updates_manager().get_or_insert(
+            "tests",
+            &agent.schema().read(),
+            agent.pool(),
+            tripwire,
+        )?;
+        let mut updates = created.expect("new updates handle").evt_rx;
+        let mut responses = Vec::new();
+        for (version, id) in [(2, 202_i64), (3, 101_i64)] {
+            if version == 3 {
+                // Every successful response has acquired a reader. Unconsumed
+                // bodies fill the bounded queues before the 1024-row query ends.
+                for _ in 0..20 {
+                    let response = api_v1_queries(
+                        Extension(agent.clone()),
+                        ConnectInfo("127.0.0.1:12345".parse()?),
+                        Query(TimeoutParams::default()),
+                        axum::Json(Statement::Simple("SELECT id, payload FROM exports".into())),
+                    )
+                    .await
+                    .into_response();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    responses.push(response);
+                }
+            }
+            let (status, body) = api_v1_transactions(
+                Extension(agent.clone()),
+                Query(TimeoutParams::default()),
+                axum::Json(vec![Statement::WithParams(
+                    "INSERT INTO tests (id, text) VALUES (?, ?)".into(),
+                    vec![id.into(), "committed".into()],
+                )]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.0.version, Some(version));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), updates.recv())
+                    .await
+                    .expect("committed write must notify while query responses hold all readers")
+                    .expect("updates channel closed"),
+                NotifyEvent::Notify(ChangeType::Update, pks) if pks == vec![id.into()]
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let message = options
+                        .rx_plumtree
+                        .recv()
+                        .await
+                        .expect("plumtree channel closed");
+                    if let PlumtreeInput::Broadcast(ChangeV1 {
+                        changeset:
+                            Changeset::FullV2 {
+                                version: actual,
+                                changes,
+                                ..
+                            },
+                        ..
+                    }) = message
+                    {
+                        if actual == CrsqlDbVersion(version) {
+                            assert!(changes.matchable_changes().any(|change| change
+                                .table
+                                .as_str()
+                                == "tests"
+                                && change.column.as_str() == "text"));
+                            break;
+                        }
+                        assert_eq!(
+                            actual,
+                            CrsqlDbVersion(1),
+                            "only fixture chunks may precede the write"
+                        );
+                    } else {
+                        panic!("unexpected plumtree message");
+                    }
+                }
+            })
+            .await
+            .expect("committed write must broadcast while query responses hold all readers");
+        }
+        drop(responses);
         Ok(())
     }
 

@@ -4462,9 +4462,12 @@ impl<'conn> Session<'conn> {
 
             book_writer.commit();
 
-            let agent = self.agent.clone();
-
-            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
+            // commit_tx retains the write context until extraction is complete.
+            // Do not return a transaction error after COMMIT has succeeded.
+            if let Err(error) = broadcast_changes(&self.agent, self.conn, db_version, last_seq, ts)
+            {
+                error!(%db_version, %error, "could not dispatch committed changes");
+            }
         }
 
         Ok(())

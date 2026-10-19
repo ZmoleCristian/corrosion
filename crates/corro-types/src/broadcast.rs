@@ -26,10 +26,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::block_in_place,
-};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, trace};
 use uhlc::NTP64;
 
@@ -40,7 +37,6 @@ use crate::{
     change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     pubsub::MatchableChange,
-    sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
     updates::match_changes,
 };
@@ -947,73 +943,56 @@ impl<T> DispatchRuntime<T> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum BroadcastError {
-    #[error(transparent)]
-    Pool(#[from] SqlitePoolError),
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-}
-
-pub async fn broadcast_changes(
-    agent: Agent,
+/// Dispatch a committed local version before releasing its write permit.
+///
+/// Use the writer connection so extraction cannot wait on the shared read pool.
+/// The caller must retain write ownership and run on a blocking thread until
+/// extraction finishes, before a later write can replace current-clock rows.
+pub fn broadcast_changes(
+    agent: &Agent,
+    conn: &rusqlite::Connection,
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
     ts: Timestamp,
-) -> Result<(), BroadcastError> {
+) -> rusqlite::Result<()> {
     let actor_id = agent.actor_id();
-    let conn = agent.pool().read().await?;
-    trace!("got conn for broadcast");
-
-    block_in_place(|| {
-        // TODO: make this more generic so both sync and local changes can use it.
-        let mut prepped = conn.prepare_cached(
-            r#"
-                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                    FROM crsql_changes
-                    WHERE db_version = ?
-                    AND site_id = crsql_site_id()
-                    ORDER BY seq ASC
-            "#,
-        )?;
-        let rows = prepped.query_map([db_version], row_to_change)?;
-        let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
-        for changes_seqs in chunked {
-            match changes_seqs {
-                Ok((changes, seqs)) => {
-                    for (table_name, count) in changes.count() {
-                        counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
-                    }
-
-                    trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
-
-                    debug!("match_changes db_version: {db_version}");
-                    let changeset = Changeset::FullV2 {
-                        actor_id,
-                        version: db_version,
-                        changes,
-                        seqs,
-                        last_seq,
-                        ts,
-                    };
-                    match_changes(agent.subs_manager(), &changeset, db_version);
-                    match_changes(agent.updates_manager(), &changeset, db_version);
-
-                    assert_sometimes!(true, "Corrosion broadcasts changes");
-                    agent.broadcaster().broadcast_local(ChangeV1 {
-                        actor_id,
-                        changeset,
-                    });
-                }
-                Err(e) => {
-                    error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                    break;
-                }
-            }
+    let mut prepped = conn.prepare_cached(
+        r#"
+            SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                FROM crsql_changes
+                WHERE db_version = ?
+                AND site_id = crsql_site_id()
+                ORDER BY seq ASC
+        "#,
+    )?;
+    let rows = prepped.query_map([db_version], row_to_change)?;
+    let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+    for changes_seqs in chunked {
+        let (changes, seqs) = changes_seqs?;
+        for (table_name, count) in changes.count() {
+            counter!("corro.changes.committed", "table" => table_name, "source" => "local")
+                .increment(count as u64);
         }
-        Ok::<_, rusqlite::Error>(())
-    })?;
 
+        trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+        debug!("match_changes db_version: {db_version}");
+        let changeset = Changeset::FullV2 {
+            actor_id,
+            version: db_version,
+            changes,
+            seqs,
+            last_seq,
+            ts,
+        };
+        match_changes(agent.subs_manager(), &changeset, db_version);
+        match_changes(agent.updates_manager(), &changeset, db_version);
+
+        assert_sometimes!(true, "Corrosion broadcasts changes");
+        agent.broadcaster().broadcast_local(ChangeV1 {
+            actor_id,
+            changeset,
+        });
+    }
     Ok(())
 }
 
