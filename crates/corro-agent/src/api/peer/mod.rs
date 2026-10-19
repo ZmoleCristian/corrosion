@@ -397,6 +397,8 @@ fn handle_need(
     let timeout = Some(Duration::from_secs(60));
     let tx = InterruptibleTransaction::new(tx, timeout, "handle_need");
 
+    // Administrative chunked apply can leave an applied prefix. Until its final
+    // transaction clears sequence bookkeeping, serve the version from the buffer.
     let mut prepped = tx.prepare_cached(
         "
         SELECT db_version, MAX(seq) AS last_seq, MAX(ts) AS ts
@@ -404,6 +406,11 @@ fn handle_need(
             WHERE site_id = :actor_id
               AND db_version BETWEEN :start AND :end
             GROUP BY db_version
+            HAVING NOT EXISTS (
+                SELECT 1 FROM __corro_seq_bookkeeping AS partial
+                WHERE partial.site_id = :actor_id
+                  AND partial.db_version = crsql_changes.db_version
+            )
             ORDER BY db_version DESC, seq ASC
     ",
     )?;
@@ -1740,11 +1747,16 @@ mod tests {
     };
     use hyper::StatusCode;
     use rand::{Rng, RngCore};
+    use rusqlite::functions::FunctionFlags;
+    use spawn::wait_for_all_pending_handles;
     use tempfile::TempDir;
     use tripwire::Tripwire;
 
     use crate::{
-        agent::{process_multiple_changes, setup, util::execute_schema},
+        agent::{
+            process_multiple_changes, setup,
+            util::{apply_buffered_version_in_chunks, execute_schema},
+        },
         api::public::TimeoutParams,
     };
 
@@ -1778,6 +1790,375 @@ mod tests {
         );
 
         assert!(validate_sync_needs(&requests[..1]).is_ok());
+    }
+
+    async fn request_buffered_sync(
+        agent: &Agent,
+        actor_id: ActorId,
+        need: SyncNeedV1,
+    ) -> eyre::Result<Vec<ChangeV1>> {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut conn = agent.pool().read().await?;
+        block_in_place(|| handle_need(&mut conn, actor_id, need, &tx))?;
+        drop(tx);
+        let mut changes = Vec::new();
+        while let Some(message) = rx.recv().await {
+            match message {
+                SyncMessage::V1(SyncMessageV1::Changeset(change)) => changes.push(change),
+                other => panic!("unexpected sync response: {other:?}"),
+            }
+        }
+        Ok(changes)
+    }
+
+    fn assert_buffered_sync(
+        changes: &[ChangeV1],
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        seqs: CrsqlSeqRange,
+        expected_rows: &[u64],
+    ) {
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].actor_id, actor_id);
+        let parts = changes[0].changeset.clone().into_parts().unwrap();
+        assert_eq!(parts.version, version);
+        assert_eq!(parts.seqs, seqs);
+        assert_eq!(parts.last_seq, CrsqlSeq(3));
+        let mut rows = parts
+            .changes
+            .iter()
+            .map(|change| change.seq.0)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows, expected_rows);
+    }
+
+    async fn buffered_sync_fixture(
+        tripwire: Tripwire,
+        payload_seqs: &[u64],
+    ) -> eyre::Result<(Agent, TempDir, ActorId)> {
+        let dir = tempfile::tempdir()?;
+        let (agent, _opts) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
+        )
+        .await?;
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let version = CrsqlDbVersion(1);
+        let ts = agent.clock().new_timestamp().into();
+        let changes = payload_seqs
+            .iter()
+            .map(|&seq| Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(seq as i64 + 1).into()]).unwrap(),
+                cid: ColumnName("text".into()),
+                val: format!("row-{seq}").into(),
+                col_version: 1,
+                db_version: version,
+                seq: CrsqlSeq(seq),
+                site_id: actor_id.to_bytes(),
+                cl: 1,
+            })
+            .collect::<Vec<_>>();
+        let chunks = [(dbsr!(0, 1), 0..=1), (dbsr!(2, 3), 2..=3)]
+            .into_iter()
+            .map(|(seqs, range)| {
+                (
+                    ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::Full {
+                            version,
+                            changes: changes
+                                .iter()
+                                .filter(|c| range.contains(&c.seq.0))
+                                .cloned()
+                                .collect(),
+                            seqs,
+                            last_seq: CrsqlSeq(3),
+                            ts,
+                        },
+                    },
+                    ChangeSource::Sync,
+                    Instant::now(),
+                )
+            })
+            .collect();
+        process_multiple_changes(
+            agent.clone(),
+            agent.bookie().clone(),
+            chunks,
+            Duration::from_secs(60),
+        )
+        .await?;
+        Ok((agent, dir, actor_id))
+    }
+
+    async fn check_chunked_sync(payload_seqs: &[u64]) -> eyre::Result<()> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let (source, _source_dir, actor_id) =
+            buffered_sync_fixture(tripwire.clone(), payload_seqs).await?;
+        let receiver_dir = tempfile::tempdir()?;
+        let (receiver, _opts) = setup(
+            Config::builder()
+                .db_path(
+                    receiver_dir
+                        .path()
+                        .join("corrosion.db")
+                        .display()
+                        .to_string(),
+                )
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
+        )
+        .await?;
+        execute_schema(&receiver, vec![TEST_SCHEMA.to_owned()]).await?;
+        let version = CrsqlDbVersion(1);
+        let full_need = || SyncNeedV1::Full {
+            versions: dbvr!(1, 1),
+        };
+        let control = request_buffered_sync(&source, actor_id, full_need()).await?;
+        assert_buffered_sync(&control, actor_id, version, dbsr!(0, 3), payload_seqs);
+
+        // Pause the second write transaction after the first chunk commits.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        struct ReleaseOnDrop(std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let (lock, condvar) = &*self.0;
+                *lock.lock().unwrap() = true;
+                condvar.notify_all();
+            }
+        }
+        let release_guard = ReleaseOnDrop(release.clone());
+        {
+            let conn = source.pool().write_priority().await?;
+            conn.create_scalar_function(
+                "test_pause_second_chunk",
+                0,
+                FunctionFlags::SQLITE_UTF8,
+                move |_| {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    let (lock, condvar) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                    Ok(0_i64)
+                },
+            )?;
+            // Both dense [0,1,2,3] and sparse [0,3] payloads enter here.
+            conn.execute_batch(
+                "CREATE TRIGGER test_pause_second_chunk_trigger
+                 BEFORE INSERT ON tests WHEN NEW.id >= 3
+                 BEGIN SELECT test_pause_second_chunk(); END;",
+            )?;
+        }
+        let source_for_apply = source.clone();
+        let apply_task = tokio::spawn(async move {
+            apply_buffered_version_in_chunks(
+                &source_for_apply,
+                source_for_apply.bookie(),
+                actor_id,
+                version,
+                2,
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), entered_rx).await??;
+        let intermediate = request_buffered_sync(&source, actor_id, full_need()).await?;
+        let partial = request_buffered_sync(
+            &source,
+            actor_id,
+            SyncNeedV1::Partial {
+                version,
+                seqs: vec![dbsr!(2, 3)],
+            },
+        )
+        .await?;
+        let counts: (i64, i64, i64) = source.pool().read().await?.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM crsql_changes WHERE site_id = ?1 AND db_version = ?2),
+                (SELECT COUNT(*) FROM __corro_buffered_changes WHERE site_id = ?1 AND db_version = ?2),
+                (SELECT COUNT(*) FROM __corro_seq_bookkeeping WHERE site_id = ?1 AND db_version = ?2)",
+            (actor_id, version),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        drop(release_guard);
+        tokio::time::timeout(Duration::from_secs(30), apply_task).await???;
+        assert_eq!(
+            counts,
+            (
+                payload_seqs.iter().filter(|&&s| s < 2).count() as i64,
+                payload_seqs.len() as i64,
+                1
+            )
+        );
+
+        // Deliver the paused response, then the completed source version.
+        // On the old query the receiver accepts only the prefix and ignores the latter.
+        let complete = request_buffered_sync(&source, actor_id, full_need()).await?;
+        assert_buffered_sync(&complete, actor_id, version, dbsr!(0, 3), payload_seqs);
+        for changes in [intermediate.clone(), complete] {
+            process_multiple_changes(
+                receiver.clone(),
+                receiver.bookie().clone(),
+                changes
+                    .into_iter()
+                    .map(|c| (c, ChangeSource::Sync, Instant::now()))
+                    .collect(),
+                Duration::from_secs(60),
+            )
+            .await?;
+        }
+        let receiver_rows: Vec<i64> = receiver
+            .pool()
+            .read()
+            .await?
+            .prepare("SELECT id FROM tests ORDER BY id")?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let receiver_booked = receiver.bookie().get(&actor_id).unwrap();
+        assert!(receiver_booked.read().contains_version(&version));
+        assert!(receiver_booked.read().get_partial(&version).is_none());
+        let receiver_sync = generate_sync(receiver.bookie(), receiver.actor_id()).await;
+        let source_sync = generate_sync(source.bookie(), source.actor_id()).await;
+        assert!(!receiver_sync
+            .compute_available_needs(&source_sync)?
+            .contains_key(&actor_id));
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        assert_eq!(
+            receiver_rows,
+            payload_seqs
+                .iter()
+                .map(|&s| s as i64 + 1)
+                .collect::<Vec<_>>(),
+            "the receiver must not retain a complete prefix after the source finishes"
+        );
+        assert_buffered_sync(&intermediate, actor_id, version, dbsr!(0, 3), payload_seqs);
+        assert_buffered_sync(
+            &partial,
+            actor_id,
+            version,
+            dbsr!(2, 3),
+            &payload_seqs
+                .iter()
+                .copied()
+                .filter(|&s| s >= 2)
+                .collect::<Vec<_>>(),
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_apply_sync_preserves_complete_payload() -> eyre::Result<()> {
+        check_chunked_sync(&[0, 1, 2, 3]).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chunked_apply_sync_preserves_sparse_payload() -> eyre::Result<()> {
+        check_chunked_sync(&[0, 3]).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn buffered_sync_exclusion_is_scoped_to_actor_and_version() -> eyre::Result<()> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let (agent, _dir, actor_id) = buffered_sync_fixture(tripwire, &[0, 1, 2, 3]).await?;
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let ts = agent.clock().new_timestamp().into();
+        let completed = [
+            (actor_id, CrsqlDbVersion(2), 10_i64),
+            (other_actor, CrsqlDbVersion(1), 11_i64),
+        ]
+        .into_iter()
+        .map(|(actor_id, version, pk)| {
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version,
+                        changes: vec![Change {
+                            table: TableName("tests".into()),
+                            pk: pack_columns(&vec![pk.into()]).unwrap(),
+                            cid: ColumnName("text".into()),
+                            val: "complete".into(),
+                            col_version: 1,
+                            db_version: version,
+                            seq: CrsqlSeq(3),
+                            site_id: actor_id.to_bytes(),
+                            cl: 1,
+                        }],
+                        seqs: dbsr!(0, 3),
+                        last_seq: CrsqlSeq(3),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            )
+        })
+        .collect();
+        process_multiple_changes(
+            agent.clone(),
+            agent.bookie().clone(),
+            completed,
+            Duration::from_secs(60),
+        )
+        .await?;
+        let mut mixed = request_buffered_sync(
+            &agent,
+            actor_id,
+            SyncNeedV1::Full {
+                versions: dbvr!(1, 2),
+            },
+        )
+        .await?;
+        mixed.sort_by_key(|change| change.versions().start());
+        assert_eq!(mixed.len(), 2);
+        assert_buffered_sync(
+            &mixed[..1],
+            actor_id,
+            CrsqlDbVersion(1),
+            dbsr!(0, 3),
+            &[0, 1, 2, 3],
+        );
+        assert_buffered_sync(&mixed[1..], actor_id, CrsqlDbVersion(2), dbsr!(0, 3), &[3]);
+        for need in [
+            SyncNeedV1::Full {
+                versions: dbvr!(1, 1),
+            },
+            SyncNeedV1::Partial {
+                version: CrsqlDbVersion(1),
+                seqs: vec![dbsr!(2, 3)],
+            },
+        ] {
+            let expected = match &need {
+                SyncNeedV1::Full { .. } => dbsr!(0, 3),
+                _ => dbsr!(2, 3),
+            };
+            let response = request_buffered_sync(&agent, other_actor, need).await?;
+            assert_buffered_sync(&response, other_actor, CrsqlDbVersion(1), expected, &[3]);
+        }
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]
