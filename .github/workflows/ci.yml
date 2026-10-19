@@ -1,4 +1,13 @@
 on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact commit SHA to validate
+        required: true
+      book_only:
+        description: Run only the legacy book check
+        type: boolean
+        default: false
   push:
     branches: [ main ]
   pull_request:
@@ -12,6 +21,7 @@ env:
 
 jobs:
   test:
+    if: ${{ !inputs.book_only }}
     name: Test
     strategy:
       fail-fast: false
@@ -30,6 +40,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_REVISION: ${{ inputs.ref }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
 
       - name: Install and Display Rust specified toolchain
         run: rustup show
@@ -48,6 +64,7 @@ jobs:
         run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
 
   lint:
+    if: ${{ !inputs.book_only }}
     strategy:
       matrix:
         include:
@@ -58,6 +75,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+    - name: Verify checked-out revision
+      env:
+        EXPECTED_REVISION: ${{ inputs.ref }}
+      run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
     - name: Install rustfmt and clippy
       run: rustup component add clippy rustfmt
     # Split fetch so timings in Github show the actual
@@ -78,6 +101,12 @@ jobs:
       pull-requests: write  # To create a PR from that branch
     steps:
       - uses: actions/checkout@master
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Verify checked-out revision
+        env:
+          EXPECTED_REVISION: ${{ inputs.ref }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
 
       - uses: dtolnay/rust-toolchain@stable
 
