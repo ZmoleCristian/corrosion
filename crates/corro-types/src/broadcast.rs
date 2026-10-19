@@ -959,7 +959,7 @@ pub fn broadcast_changes(
     let mut prepped = conn.prepare_cached(
         r#"
             SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                FROM crsql_changes
+                FROM main.crsql_changes
                 WHERE db_version = ?
                 AND site_id = crsql_site_id()
                 ORDER BY seq ASC
