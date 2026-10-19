@@ -1,4 +1,9 @@
 on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact commit SHA to validate
+        required: true
   push:
     branches: [ main ]
   pull_request:
@@ -30,6 +35,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Verify checked-out revision
+        shell: bash
+        env:
+          EXPECTED_REVISION: ${{ inputs.ref }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
 
       - name: Install and Display Rust specified toolchain
         run: rustup show
@@ -58,6 +70,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+    - name: Verify checked-out revision
+      shell: bash
+      env:
+        EXPECTED_REVISION: ${{ inputs.ref }}
+      run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
     - name: Install rustfmt and clippy
       run: rustup component add clippy rustfmt
     # Split fetch so timings in Github show the actual
@@ -78,6 +97,13 @@ jobs:
       pull-requests: write  # To create a PR from that branch
     steps:
       - uses: actions/checkout@master
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Verify checked-out revision
+        shell: bash
+        env:
+          EXPECTED_REVISION: ${{ inputs.ref }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_REVISION"
 
       - uses: dtolnay/rust-toolchain@stable
 
