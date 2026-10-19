@@ -399,6 +399,19 @@ async fn setup_spawn_subscriptions(
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
 }
 
+fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0u8; 4];
+    let peeked = file.read(&mut prefix)?;
+    let is_dict = peeked == 4 && u32::from_le_bytes(prefix) == zstd::zstd_safe::MAGIC_DICTIONARY;
+    if !is_dict {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,17 +479,4 @@ mod tests {
 
         Ok(())
     }
-}
-
-fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {
-    let mut prefix = [0u8; 4];
-    let peeked = file.read(&mut prefix)?;
-    let is_dict = peeked == 4 && u32::from_le_bytes(prefix) == zstd::zstd_safe::MAGIC_DICTIONARY;
-    if !is_dict {
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(0))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
 }

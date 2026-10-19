@@ -1767,7 +1767,7 @@ mod tests {
             }
             let table = if canonical { "main.tests" } else { "tests" };
             let statements = vec![Statement::WithParams(
-                format!("INSERT INTO {table} (id, text) VALUES (?, ?)").into(),
+                format!("INSERT INTO {table} (id, text) VALUES (?, ?)"),
                 vec![id.into(), "committed".into()],
             )];
             assert_eq!(
