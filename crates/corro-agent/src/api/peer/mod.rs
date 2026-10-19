@@ -1793,13 +1793,12 @@ mod tests {
     }
 
     async fn request_buffered_sync(
-        agent: &Agent,
+        conn: &mut Connection,
         actor_id: ActorId,
         need: SyncNeedV1,
     ) -> eyre::Result<Vec<ChangeV1>> {
         let (tx, mut rx) = mpsc::channel(16);
-        let mut conn = agent.pool().read().await?;
-        block_in_place(|| handle_need(&mut conn, actor_id, need, &tx))?;
+        block_in_place(|| handle_need(conn, actor_id, need, &tx))?;
         drop(tx);
         let mut changes = Vec::new();
         while let Some(message) = rx.recv().await {
@@ -1923,9 +1922,6 @@ mod tests {
         let full_need = || SyncNeedV1::Full {
             versions: dbvr!(1, 1),
         };
-        let control = request_buffered_sync(&source, actor_id, full_need()).await?;
-        assert_buffered_sync(&control, actor_id, version, dbsr!(0, 3), payload_seqs);
-
         // Pause the second write transaction after the first chunk commits.
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let entered_tx = std::sync::Mutex::new(Some(entered_tx));
@@ -1951,9 +1947,20 @@ mod tests {
                         let _ = tx.send(());
                     }
                     let (lock, condvar) = &*release;
-                    let mut released = lock.lock().unwrap();
-                    while !*released {
-                        released = condvar.wait(released).unwrap();
+                    let (released, _) = condvar
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            Duration::from_secs(30),
+                            |released| !*released,
+                        )
+                        .unwrap();
+                    if !*released {
+                        return Err(rusqlite::Error::UserFunctionError(Box::new(
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "paused sync reads did not release the second chunk",
+                            ),
+                        )));
                     }
                     Ok(0_i64)
                 },
@@ -1965,6 +1972,17 @@ mod tests {
                  BEGIN SELECT test_pause_second_chunk(); END;",
             )?;
         }
+        // Finish reader initialization and statement preparation after the trigger
+        // changes the schema, before deliberately blocking the writer.
+        let mut sync_conn = source.pool().read().await?;
+        let control = request_buffered_sync(&mut sync_conn, actor_id, full_need()).await?;
+        assert_buffered_sync(&control, actor_id, version, dbsr!(0, 3), payload_seqs);
+        let partial_need = || SyncNeedV1::Partial {
+            version,
+            seqs: vec![dbsr!(2, 3)],
+        };
+        request_buffered_sync(&mut sync_conn, actor_id, partial_need()).await?;
+
         let source_for_apply = source.clone();
         let apply_task = tokio::spawn(async move {
             apply_buffered_version_in_chunks(
@@ -1978,17 +1996,13 @@ mod tests {
             .await
         });
         tokio::time::timeout(Duration::from_secs(30), entered_rx).await??;
-        let intermediate = request_buffered_sync(&source, actor_id, full_need()).await?;
-        let partial = request_buffered_sync(
-            &source,
-            actor_id,
-            SyncNeedV1::Partial {
-                version,
-                seqs: vec![dbsr!(2, 3)],
-            },
-        )
-        .await?;
-        let counts: (i64, i64, i64) = source.pool().read().await?.query_row(
+        let intermediate = request_buffered_sync(&mut sync_conn, actor_id, full_need())
+            .await
+            .wrap_err("full sync while the second chunk is paused")?;
+        let partial = request_buffered_sync(&mut sync_conn, actor_id, partial_need())
+            .await
+            .wrap_err("partial sync while the second chunk is paused")?;
+        let counts: (i64, i64, i64) = sync_conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM crsql_changes WHERE site_id = ?1 AND db_version = ?2),
                 (SELECT COUNT(*) FROM __corro_buffered_changes WHERE site_id = ?1 AND db_version = ?2),
@@ -2009,7 +2023,8 @@ mod tests {
 
         // Deliver the paused response, then the completed source version.
         // On the old query the receiver accepts only the prefix and ignores the latter.
-        let complete = request_buffered_sync(&source, actor_id, full_need()).await?;
+        let complete = request_buffered_sync(&mut sync_conn, actor_id, full_need()).await?;
+        drop(sync_conn);
         assert_buffered_sync(&complete, actor_id, version, dbsr!(0, 3), payload_seqs);
         for changes in [intermediate.clone(), complete] {
             process_multiple_changes(
@@ -2121,8 +2136,9 @@ mod tests {
             Duration::from_secs(60),
         )
         .await?;
+        let mut sync_conn = agent.pool().read().await?;
         let mut mixed = request_buffered_sync(
-            &agent,
+            &mut sync_conn,
             actor_id,
             SyncNeedV1::Full {
                 versions: dbvr!(1, 2),
@@ -2152,9 +2168,10 @@ mod tests {
                 SyncNeedV1::Full { .. } => dbsr!(0, 3),
                 _ => dbsr!(2, 3),
             };
-            let response = request_buffered_sync(&agent, other_actor, need).await?;
+            let response = request_buffered_sync(&mut sync_conn, other_actor, need).await?;
             assert_buffered_sync(&response, other_actor, CrsqlDbVersion(1), expected, &[3]);
         }
+        drop(sync_conn);
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
