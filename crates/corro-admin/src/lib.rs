@@ -1,14 +1,20 @@
 use std::{
+    collections::HashMap,
     fmt::Display,
     time::{Duration, Instant},
 };
 
 use camino::Utf8PathBuf;
+use corro_agent::agent::{
+    reload_change_dicts,
+    util::{apply_buffered_version_in_chunks, execute_schema_from_paths},
+};
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
+    agent::{Agent, BookedVersions, Bookie, WriteConn},
     base::{CrsqlDbVersion, CrsqlSeq},
-    broadcast::{FocaCmd, FocaInput},
+    broadcast::{FocaCmd, FocaInput, PlumtreeInput},
+    config::BroadcastMethod,
     sqlite::SqlitePoolError,
     sync::generate_sync,
     updates::Handle,
@@ -36,6 +42,8 @@ use uuid::Uuid;
 pub enum AdminError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Report(#[from] eyre::Report),
 }
 
 #[derive(Debug, Clone)]
@@ -103,17 +111,30 @@ pub fn start_server(
 pub enum Command {
     Ping,
     Sync(SyncCommand),
-    Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
     Subs(SubsCommand),
     Log(LogCommand),
+    Plumtree(PlumtreeCommand),
+    Reload,
+    ReloadDicts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlumtreeCommand {
+    Stats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SyncCommand {
     Generate,
     ReconcileGaps,
+    CheckBookieConsistency,
+    ProcessBufferedChanges {
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        chunk_size: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,25 +211,6 @@ type FramedStream = Framed<
     Json<Command, Response>,
 >;
 
-#[derive(Serialize, Deserialize)]
-pub struct LockMetaElapsed {
-    pub label: String,
-    pub kind: LockKind,
-    pub state: LockState,
-    pub duration: Duration,
-}
-
-impl From<LockMeta> for LockMetaElapsed {
-    fn from(value: LockMeta) -> Self {
-        LockMetaElapsed {
-            label: value.label.into(),
-            kind: value.kind,
-            state: value.state,
-            duration: value.started_at.elapsed(),
-        }
-    }
-}
-
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
@@ -231,6 +233,38 @@ async fn handle_conn(
         match stream.try_next().await {
             Ok(Some(cmd)) => match cmd {
                 Command::Ping => send_success(&mut stream).await,
+                Command::Reload => {
+                    info_log(&mut stream, "reloading schema from configured paths...").await;
+                    if let Err(e) = execute_schema_from_paths(&agent).await {
+                        send_error(&mut stream, e).await;
+                        continue;
+                    }
+                    info_log(&mut stream, "schema reload finished").await;
+                    send_success(&mut stream).await;
+                }
+                Command::ReloadDicts => {
+                    info_log(
+                        &mut stream,
+                        "reloading zstd compression dictionaries from configured dict_dir...",
+                    )
+                    .await;
+                    match reload_change_dicts(&agent) {
+                        Ok(decoder_count) => {
+                            info_log(
+                                &mut stream,
+                                format!(
+                                    "compression dictionary reload finished ({decoder_count} decoder dicts)"
+                                ),
+                            )
+                            .await;
+                            send_success(&mut stream).await;
+                        }
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    }
+                }
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;
                     let sync_state = generate_sync(bookie, agent.actor_id()).await;
@@ -241,8 +275,8 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
-                    info_log(&mut stream, "reconciling gaps...").await;
-                    let mut conn = match agent.pool().write_low().await {
+                    // First acquire all actor_ids via a read only sqlite connection
+                    let ro_conn = match agent.pool().read().await {
                         Ok(conn) => conn,
                         Err(e) => {
                             send_error(&mut stream, e).await;
@@ -251,7 +285,7 @@ async fn handle_conn(
                     };
 
                     let actor_ids = {
-                        match get_gaps_actor_ids(&conn) {
+                        match block_in_place(|| get_gaps_actor_ids(&ro_conn)) {
                             Ok(actor_ids) => actor_ids,
                             Err(e) => {
                                 send_error(&mut stream, e).await;
@@ -259,47 +293,139 @@ async fn handle_conn(
                             }
                         }
                     };
-                    for actor_id in actor_ids {
-                        let booked = bookie
-                            .read("admin sync reconcile gaps get actor", actor_id.as_simple())
-                            .await
-                            .get(&actor_id)
-                            .unwrap()
-                            .clone();
 
-                        let mut bv = booked
-                            .write::<&str, _>("admin sync reconcile gaps booked versions", None)
-                            .await;
-                        debug_log(&mut stream, format!("got bookie for actor id: {actor_id}"))
-                            .await;
-                        if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
-                            send_error(&mut stream, e).await;
-                            continue;
+                    info_log(
+                        &mut stream,
+                        format!("reconciling gaps for {} actors...", actor_ids.len()),
+                    )
+                    .await;
+                    // To avoid blocking the db for too long we release the write connection from time to time
+                    for batch in actor_ids.chunks(16) {
+                        let mut rw_conn = match agent.pool().write_low().await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                send_error(&mut stream, e).await;
+                                continue;
+                            }
+                        };
+
+                        for actor_id in batch {
+                            _ = info_log(&mut stream, format!("collapsing ranges for {actor_id}"))
+                                .await;
+                            let start = Instant::now();
+                            let res = collapse_gaps(&mut rw_conn, bookie, actor_id)
+                                .map(|(deleted, inserted)| (deleted, inserted, start.elapsed()));
+
+                            let (deleted, inserted, elapsed) = match res {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    send_error(&mut stream, e).await;
+                                    continue;
+                                }
+                            };
+
+                            info_log(
+                            &mut stream,
+                            format!(
+                                "collapsed ranges for {actor_id} in {elapsed:?} (deleted: {deleted}, inserted: {inserted})"
+                            ),
+                        )
+                        .await;
                         }
                     }
 
                     send_success(&mut stream).await;
                 }
-                Command::Locks { top } => {
-                    info_log(&mut stream, "gathering top locks").await;
-                    let registry = bookie.registry();
+                Command::Sync(SyncCommand::CheckBookieConsistency) => {
+                    info_log(
+                        &mut stream,
+                        "checking in-memory and DB bookie consistency...",
+                    )
+                    .await;
 
-                    let topn: Vec<LockMetaElapsed> = {
-                        registry
-                            .map
-                            .read()
-                            .values()
-                            .take(top)
-                            .cloned()
-                            .map(LockMetaElapsed::from)
-                            .collect()
+                    let rw_conn = match agent.pool().write_low().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
                     };
 
-                    match serde_json::to_value(&topn) {
+                    let report = match block_in_place(|| check_bookie_consistency(rw_conn, bookie))
+                    {
+                        Ok(report) => report,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    };
+
+                    match serde_json::to_value(&report) {
                         Ok(json) => send(&mut stream, Response::Json(json)).await,
-                        Err(e) => send_error(&mut stream, e).await,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
                     }
+
+                    if !report.ok {
+                        send_error(
+                            &mut stream,
+                            format!(
+                                "bookie mismatch: value_mismatch={}, only_in_memory={}, only_in_db={}",
+                                report.value_mismatch_actors.len(),
+                                report.only_in_memory_actors.len(),
+                                report.only_in_db_actors.len()
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+
                     send_success(&mut stream).await;
+                }
+                Command::Sync(SyncCommand::ProcessBufferedChanges {
+                    actor_id,
+                    version,
+                    chunk_size,
+                }) => {
+                    let (progress_tx, mut progress_rx) = mpsc::channel(64);
+                    let (result, _) = tokio::join!(
+                        apply_buffered_version_in_chunks(
+                            &agent,
+                            bookie,
+                            actor_id,
+                            version,
+                            chunk_size,
+                            Some(progress_tx),
+                        ),
+                        async {
+                            while let Some(p) = progress_rx.recv().await {
+                                info_log(&mut stream, p.to_string()).await;
+                            }
+                        }
+                    );
+
+                    match result {
+                        Ok(None) => {
+                            send_error(&mut stream, "version not fully buffered").await;
+                            continue;
+                        }
+                        Ok(Some(total)) => {
+                            info_log(
+                                &mut stream,
+                                format!(
+                                    "finished processing buffered changes for actor {actor_id} version {version} (total rows: {total})",
+                                ),
+                            )
+                            .await;
+                            send_success(&mut stream).await;
+                        }
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    }
                 }
                 Command::Cluster(ClusterCommand::Rejoin) => {
                     let (cb_tx, cb_rx) = oneshot::channel();
@@ -415,7 +541,6 @@ async fn handle_conn(
                 }
                 Command::Actor(ActorCommand::Version { actor_id, version }) => {
                     let json: Result<serde_json::Value, rusqlite::Error> = {
-                        let bookie = bookie.read::<&str, _>("admin actor version", None).await;
                         let booked = match bookie.get(&actor_id) {
                             Some(booked) => booked,
                             None => {
@@ -424,9 +549,7 @@ async fn handle_conn(
                                 continue;
                             }
                         };
-                        let booked_read = booked
-                            .read::<&str, _>("admin actor version booked", None)
-                            .await;
+                        let booked_read = booked.read();
                         if booked_read.contains_version(&version) {
                             match booked_read.get_partial(&version) {
                                 Some(partial) => {
@@ -483,6 +606,7 @@ async fn handle_conn(
                                "id": k,
                                "hash": v.hash(),
                                 "sql": v.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
+                                "ms_per_sec_cost": v.ms_per_sec(),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -519,6 +643,7 @@ async fn handle_conn(
                                     "last_change_id": matcher.last_change_id_sent(),
                                     "original_query": matcher.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
                                     "statements": statements,
+                                    "ms_per_sec_cost": matcher.ms_per_sec(),
                                 })),
                             )
                             .await;
@@ -584,6 +709,49 @@ async fn handle_conn(
                         }
                     }
                 },
+                Command::Plumtree(cmd) => {
+                    if !matches!(agent.broadcast_method(), BroadcastMethod::Plumtree) {
+                        send_error(
+                            &mut stream,
+                            "plumtree broadcast method is not enabled on this node",
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    match cmd {
+                        PlumtreeCommand::Stats => {
+                            let (tx, rx) = oneshot::channel();
+                            if let Err(e) = agent
+                                .tx_plumtree()
+                                .send(PlumtreeInput::QueryStats(tx))
+                                .await
+                            {
+                                send_error(&mut stream, e).await;
+                                continue;
+                            }
+
+                            let stats = match rx.await {
+                                Ok(stats) => stats,
+                                Err(e) => {
+                                    send_error(&mut stream, e).await;
+                                    continue;
+                                }
+                            };
+
+                            let value = match serde_json::to_value(&stats) {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    send_error(&mut stream, e).await;
+                                    continue;
+                                }
+                            };
+
+                            send(&mut stream, Response::Json(value)).await;
+                            send_success(&mut stream).await;
+                        }
+                    }
+                }
             },
             Ok(None) => {
                 debug!("done with admin conn");
@@ -660,22 +828,26 @@ async fn send_error<E: Display>(stream: &mut FramedStream, error: E) {
 }
 
 fn get_gaps_actor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ActorId>> {
-    conn.prepare_cached("SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps")?
-        .query_map([], |row| row.get::<_, ActorId>(0))?
-        .collect::<Result<Vec<_>, _>>()
+    conn.prepare_cached(
+        "SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps
+        UNION
+        SELECT DISTINCT site_id FROM __corro_buffered_changes",
+    )?
+    .query_map([], |row| row.get::<_, ActorId>(0))?
+    .collect::<Result<Vec<_>, _>>()
 }
 
-async fn collapse_gaps(
-    stream: &mut FramedStream,
+fn collapse_gaps(
     conn: &mut rusqlite::Connection,
-    bv: &mut BookedVersions,
-) -> rusqlite::Result<()> {
-    let actor_id = bv.actor_id();
-    let mut snap = bv.snapshot();
-    _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
-    let start = Instant::now();
+    bookie: &Bookie,
+    actor_id: &ActorId,
+) -> rusqlite::Result<(usize, usize)> {
+    let booked = bookie.ensure(*actor_id);
     let (deleted, inserted) = block_in_place(|| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let bookie_write = bookie.write_lock_blocking();
+        let mut bv = bookie_write.write_tx(&booked);
+
         let versions = tx
             .prepare_cached("SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?
             .query_map(rusqlite::params![actor_id], |row| {
@@ -688,10 +860,28 @@ async fn collapse_gaps(
             [actor_id],
         )?;
 
-        snap.insert_gaps(versions);
+        // insert gaps for buffered changes that are missing bookkeeping on __corro_seq_bookkeeping
+        let buffered_versions = tx
+            .prepare_cached(
+                "
+            SELECT DISTINCT db_version FROM __corro_buffered_changes bc
+                WHERE bc.site_id = ? 
+            AND NOT EXISTS (
+            SELECT 1 FROM __corro_seq_bookkeeping bk 
+                WHERE bk.site_id = bc.site_id 
+                AND bk.db_version = bc.db_version)",
+            )?
+            .query_map(rusqlite::params![actor_id], |row| {
+                let db_version = row.get::<_, CrsqlDbVersion>(0)?;
+                Ok(db_version..=db_version)
+            })?
+            .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlDbVersion>>>()?;
+
+        bv.insert_gaps(versions);
+        bv.insert_gaps(buffered_versions);
 
         let mut inserted = 0;
-        for range in snap.needed().iter() {
+        for range in bv.needed().iter() {
             tx.prepare_cached(
                 "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
             )?
@@ -700,19 +890,80 @@ async fn collapse_gaps(
         }
 
         tx.commit()?;
+        bv.commit();
 
         Ok::<_, rusqlite::Error>((deleted, inserted))
     })?;
 
-    _ = info_log(
-        stream,
-        format!(
-            "collapsed ranges in {:?} (deleted: {deleted}, inserted: {inserted})",
-            start.elapsed()
-        ),
-    )
-    .await;
+    Ok((deleted, inserted))
+}
 
-    bv.commit_snapshot(snap);
-    Ok(())
+#[derive(Debug, Serialize)]
+struct BookieConsistencyReport {
+    ok: bool,
+    in_memory_actors: usize,
+    db_actors: usize,
+    value_mismatch_actors: Vec<ActorId>,
+    only_in_memory_actors: Vec<ActorId>,
+    only_in_db_actors: Vec<ActorId>,
+}
+
+fn check_bookie_consistency(
+    rw_conn: WriteConn,
+    bookie: &Bookie,
+) -> rusqlite::Result<BookieConsistencyReport> {
+    let (in_memory_map, db_map): (
+        HashMap<ActorId, BookedVersions>,
+        HashMap<ActorId, BookedVersions>,
+    ) = {
+        let _bookie_write_guard: corro_types::agent::BookieWriteGuard =
+            bookie.write_lock_blocking();
+        let db_map = BookedVersions::load_all_from_conn(&rw_conn)?;
+
+        let guard = bookie.owned_guard();
+        let in_memory_map = bookie
+            .iter(&guard)
+            .map(|(actor_id, booked)| {
+                let read = booked.read();
+                (*actor_id, (**read).clone())
+            })
+            .collect();
+
+        // Release the locks asap
+        drop(rw_conn);
+        (in_memory_map, db_map)
+    };
+
+    let mut value_mismatch_actors = Vec::new();
+    let mut only_in_memory_actors = Vec::new();
+    let mut only_in_db_actors = Vec::new();
+
+    for (actor_id, mem) in &in_memory_map {
+        match db_map.get(actor_id) {
+            Some(db) if db != mem => value_mismatch_actors.push(*actor_id),
+            Some(_) => {}
+            None => only_in_memory_actors.push(*actor_id),
+        }
+    }
+
+    for actor_id in db_map.keys() {
+        if !in_memory_map.contains_key(actor_id) {
+            only_in_db_actors.push(*actor_id);
+        }
+    }
+
+    value_mismatch_actors.sort_unstable();
+    only_in_memory_actors.sort_unstable();
+    only_in_db_actors.sort_unstable();
+
+    Ok(BookieConsistencyReport {
+        ok: value_mismatch_actors.is_empty()
+            && only_in_memory_actors.is_empty()
+            && only_in_db_actors.is_empty(),
+        in_memory_actors: in_memory_map.len(),
+        db_actors: db_map.len(),
+        value_mismatch_actors,
+        only_in_memory_actors,
+        only_in_db_actors,
+    })
 }

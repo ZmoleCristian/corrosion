@@ -9,8 +9,8 @@ use alloc::ffi::CString;
 pub use crate::bindings::{
     sqlite3, sqlite3_api_routines as api_routines, sqlite3_context as context,
     sqlite3_index_info as index_info,
-    sqlite3_index_info_sqlite3_index_constraint as index_constraint,
-    sqlite3_index_info_sqlite3_index_constraint_usage as index_constraint_usage,
+    crsql_index_constraint as index_constraint,
+    crsql_index_constraint_usage as index_constraint_usage,
     sqlite3_module as module, sqlite3_stmt as stmt, sqlite3_uint64 as uint64,
     sqlite3_value as value, sqlite3_vtab as vtab, sqlite3_vtab_cursor as vtab_cursor,
     sqlite_int64 as int64, SQLITE_DETERMINISTIC as DETERMINISTIC, SQLITE_DIRECTONLY as DIRECTONLY,

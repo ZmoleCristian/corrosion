@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -18,8 +18,10 @@ use corro_client::CorrosionApiClient;
 use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
-    base::CrsqlDbVersion,
-    config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
+    base::{CrsqlDbVersion, CrsqlSeq},
+    broadcast::{ChangeV1, Changeset, Timestamp},
+    change::{row_to_change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    config::{default_admin_path, AuthzConfig, Config, ConfigError, LogFormat, OtelConfig},
     sqlite::CrConn,
 };
 use futures::StreamExt;
@@ -27,7 +29,8 @@ use once_cell::sync::OnceCell;
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk as os;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use speedy::Writable;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
     fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
@@ -156,6 +159,19 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
     Ok(tracing_handle)
 }
 
+async fn vacuum_into(db_path: &Path, destination: &str) -> eyre::Result<PathBuf> {
+    let destination_path = PathBuf::from(destination);
+
+    if let Some(parent) = destination_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute("VACUUM INTO ?;", [destination])?;
+
+    Ok(destination_path)
+}
+
 async fn process_cli(cli: Cli) -> eyre::Result<()> {
     let tracing_handle = init_tracing(&cli)?;
 
@@ -167,23 +183,12 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         Command::Backup { path } => {
             // assert_sometimes!(true, "Corrosion database is backed up");
             let db_path = cli.db_path()?;
+            let backup_path = vacuum_into(db_path.as_std_path(), path).await?;
 
             {
-                let conn = Connection::open(&db_path)?;
-                conn.execute("VACUUM INTO ?;", [&path])?;
-            }
-
-            {
-                let path = PathBuf::from(path);
-
-                // make sure parent path exists
-                if let Some(parent) = path.parent() {
-                    _ = tokio::fs::create_dir_all(parent).await;
-                }
-
                 // crsqlite connection here cause crsql_site_id table has a trigger
                 // that calls a crsqlite function.
-                let conn = CrConn::init(Connection::open(&path)?)?;
+                let conn = CrConn::init(Connection::open(&backup_path)?)?;
 
                 let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
@@ -392,9 +397,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 Some(consul) => {
                     command::consul::sync::run(consul, cli.api_addr()?, cli.db_path()?).await?
                 }
-                None => {
-                    error!("missing `consul` block in corrosion config");
-                }
+                None => eyre::bail!("missing `consul` block in corrosion config"),
             },
         },
         Command::Query {
@@ -482,9 +485,8 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
             }
         }
-        Command::Reload => {
-            command::reload::run(cli.api_addr()?, &cli.config()?.db.schema_paths).await?
-        }
+        Command::Reload => command::reload::run(cli.admin_path()).await?,
+        Command::ReloadDicts => command::reload::run_dicts(cli.admin_path()).await?,
         Command::Sync(SyncCommand::Generate) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Sync(
@@ -499,10 +501,27 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::Locks { top } => {
+        Command::Sync(SyncCommand::CheckBookieConsistency) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
-            conn.send_command(corro_admin::Command::Locks { top: *top })
-                .await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::CheckBookieConsistency,
+            ))
+            .await?;
+        }
+        Command::Sync(SyncCommand::ProcessBufferedChanges {
+            actor_id,
+            version,
+            chunk_size,
+        }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ProcessBufferedChanges {
+                    actor_id: ActorId(*actor_id),
+                    version: CrsqlDbVersion(*version),
+                    chunk_size: *chunk_size,
+                },
+            ))
+            .await?;
         }
         Command::Template { template, flags } => {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
@@ -562,6 +581,70 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             info!("Exited with code: {:?}", exit.code());
             std::process::exit(exit.code().unwrap_or(1));
         }
+        Command::Db(DbCommand::SampleChanges { out, limit }) => {
+            let db_path = cli.db_path()?;
+            let mut conn = CrConn::init(Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )?)?;
+
+            std::fs::create_dir_all(out)?;
+            let tx = conn.transaction()?;
+
+            let mut version_stmt = tx.prepare(
+                "SELECT DISTINCT site_id, db_version
+                    FROM crsql_changes
+                    ORDER BY ts DESC
+                    LIMIT ?",
+            )?;
+
+            let versions: Vec<(ActorId, CrsqlDbVersion)> = version_stmt
+                .query_map([*limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+
+            let mut written = 0usize;
+            for (actor_id, version) in versions {
+                let (last_seq, ts): (CrsqlSeq, Timestamp) = tx.query_row(
+                    "SELECT MAX(seq), MAX(ts)
+                         FROM crsql_changes
+                         WHERE site_id = ? AND db_version = ?",
+                    (actor_id, version),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+
+                let mut change_stmt = tx.prepare(
+                    r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                           FROM crsql_changes
+                           WHERE site_id = ? AND db_version = ?
+                           ORDER BY seq ASC"#,
+                )?;
+                let rows = change_stmt.query_map((actor_id, version), row_to_change)?;
+                let chunked =
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+
+                for (i, chunk) in chunked.enumerate() {
+                    let (changes, seqs) = chunk?;
+                    let change = ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::FullV2 {
+                            actor_id,
+                            version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        },
+                    };
+                    let encoded = change.write_to_vec()?;
+                    std::fs::write(out.join(format!("{actor_id}_{version}_{i}.bin")), &encoded)?;
+                    written += 1;
+                }
+            }
+
+            info!("wrote {written} change samples to {out}");
+        }
         Command::Subs(SubsCommand::Info { hash, id }) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Subs(corro_admin::SubsCommand::Info {
@@ -586,6 +669,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Reset))
                 .await?;
+        }
+        Command::Plumtree(PlumtreeCommand::Stats) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Plumtree(
+                corro_admin::PlumtreeCommand::Stats,
+            ))
+            .await?;
         }
     }
 
@@ -636,7 +726,15 @@ impl Cli {
     fn api_client(&self) -> Result<CorrosionApiClient, ConfigError> {
         API_CLIENT
             .get_or_try_init(|| {
-                CorrosionApiClient::new(self.api_addr()?)
+                // Best-effort read of the bearer token from config. If `--api-addr`
+                // is provided without a usable config file, fall through to an
+                // unauthenticated client rather than failing here.
+                let auth_token = self.config().ok().and_then(|c| {
+                    c.api.authorization.map(|authz| match authz {
+                        AuthzConfig::BearerToken(token) => token,
+                    })
+                });
+                CorrosionApiClient::with_auth_token(self.api_addr()?, auth_token)
                     .map_err(|err| config::ConfigError::Foreign(Box::new(err)).into())
             })
             .cloned()
@@ -684,9 +782,7 @@ enum Command {
     Agent,
 
     /// Backup the Corrosion DB
-    Backup {
-        path: String,
-    },
+    Backup { path: String },
 
     /// Restore the Corrosion DB from a backup
     Restore {
@@ -729,16 +825,16 @@ enum Command {
         timeout: Option<u64>,
     },
 
-    /// Reload the config
+    /// Reload Corrosion schema
     Reload,
+
+    /// Rescan gossip.compression.dict_dir and reload zstd dictionaries
+    /// without restarting the agent
+    ReloadDicts,
 
     /// Sync-related commands
     #[command(subcommand)]
     Sync(SyncCommand),
-
-    Locks {
-        top: usize,
-    },
 
     /// Actor-related commands
     #[command(subcommand)]
@@ -765,6 +861,16 @@ enum Command {
     /// Log related commands
     #[command(subcommand)]
     Log(LogCommand),
+
+    /// Plumtree broadcast overlay commands
+    #[command(subcommand)]
+    Plumtree(PlumtreeCommand),
+}
+
+#[derive(Subcommand)]
+enum PlumtreeCommand {
+    /// Dump key plumtree overlay stats
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -791,7 +897,18 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+    /// Check in-memory bookie state against DB-loaded bookie state
+    CheckBookieConsistency,
     ReconcileGaps,
+    /// Apply a single fully-buffered (gap-free) version's changes into crsql_changes,
+    /// in smaller batches instead of one large insert
+    ProcessBufferedChanges {
+        actor_id: Uuid,
+        version: u64,
+        /// Number of buffered rows (seqs) to insert per batch
+        #[arg(long, default_value = "1000")]
+        chunk_size: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -846,6 +963,17 @@ enum TlsClientCommand {
 enum DbCommand {
     /// Acquires the lock on the DB
     Lock { cmd: String },
+    /// Write recent changes to disk as speedy-encoded `ChangeV1` samples,
+    /// one file per change chunk (as produced by ChunkedChanges), for training a zstd compression
+    /// dictionary with `db train-dict`
+    SampleChanges {
+        /// Directory to write samples into
+        #[arg(long)]
+        out: Utf8PathBuf,
+        /// How many of the most recent db_versions to sample
+        #[arg(long, default_value = "5000")]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -867,4 +995,33 @@ enum LogCommand {
     Set { filter: String },
     /// Reset the log filter to default
     Reset,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vacuum_into;
+    use rusqlite::Connection;
+
+    #[tokio::test]
+    async fn vacuum_into_creates_missing_parent_directories() -> eyre::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let source_path = temp_dir.path().join("source.db");
+        let destination_path = temp_dir.path().join("backups/nested/backup.db");
+
+        let source = Connection::open(&source_path)?;
+        source.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+        source.execute("INSERT INTO test (id) VALUES (1)", [])?;
+        drop(source);
+
+        assert!(!destination_path.parent().unwrap().exists());
+
+        let destination = destination_path.to_string_lossy();
+        vacuum_into(&source_path, &destination).await?;
+
+        let backup = Connection::open(&destination_path)?;
+        let row_count: i64 = backup.query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))?;
+        assert_eq!(row_count, 1);
+
+        Ok(())
+    }
 }

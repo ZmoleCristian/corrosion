@@ -45,7 +45,7 @@ use crate::{
     api::QueryEvent,
     change::Change,
     schema::{Schema, Table},
-    sqlite::CrConn,
+    sqlite::{trace_heavy_queries_subs, CrConn},
     updates::HandleMetrics,
 };
 
@@ -278,6 +278,52 @@ struct InnerMatcherHandle {
     subs_path: String,
     cached_statements: HashMap<String, MatcherStmt>,
     metrics: HashMap<String, HandleMetrics>,
+    /// EMA of ms/s spent in handle_candidates
+    processing_stats: Arc<Mutex<ProcessingStats>>,
+}
+
+/// Tracks a moving average of ms/s for subscription processing cost.
+struct ProcessingStats {
+    /// Exponential moving average of ms/s
+    ema_ms_per_sec: f64,
+    /// Time of the last handle_candidates completion
+    last_process_time: Option<Instant>,
+}
+
+impl ProcessingStats {
+    /// Alpha for EMA smoothing. Higher = more responsive to recent data.
+    const ALPHA: f64 = 0.3;
+
+    /// Update the EMA with a new processing duration.
+    fn record(&mut self, elapsed: Duration) {
+        let now = Instant::now();
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        let ms_per_sec = match self.last_process_time {
+            Some(prev) => {
+                let interval = (now - prev).as_secs_f64();
+                if interval > 0.0 {
+                    ms / interval
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        self.ema_ms_per_sec = if self.ema_ms_per_sec == 0.0 {
+            ms_per_sec
+        } else {
+            Self::ALPHA * ms_per_sec + (1.0 - Self::ALPHA) * self.ema_ms_per_sec
+        };
+        self.last_process_time = Some(now);
+    }
+}
+
+impl std::fmt::Debug for ProcessingStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessingStats")
+            .field("ema_ms_per_sec", &self.ema_ms_per_sec)
+            .finish()
+    }
 }
 
 pub type MatchCandidates = IndexMap<TableName, IndexMap<Vec<u8>, i64>>;
@@ -360,6 +406,10 @@ impl MatcherHandle {
         &self.inner.hash
     }
 
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.inner.cancel.clone()
+    }
+
     pub fn parsed_columns(&self) -> &[ResultColumn] {
         &self.inner.parsed.columns
     }
@@ -378,6 +428,10 @@ impl MatcherHandle {
 
     pub fn pool(&self) -> &RusqlitePool {
         &self.inner.pool
+    }
+
+    pub fn ms_per_sec(&self) -> f64 {
+        self.inner.processing_stats.lock().ema_ms_per_sec
     }
 
     fn wait_for_running_state(&self) {
@@ -562,6 +616,7 @@ pub struct Matcher {
     last_change_tx: watch::Sender<ChangeId>,
     changes_rx: mpsc::Receiver<MatchCandidates>,
     purge_rx: mpsc::Receiver<oneshot::Sender<rusqlite::Result<usize>>>,
+    processing_stats: Arc<Mutex<ProcessingStats>>,
 }
 
 #[derive(Debug, Clone)]
@@ -586,7 +641,7 @@ pub const SUB_DB_PATH: &str = "sub.sqlite";
 impl Matcher {
     fn new(
         id: Uuid,
-        subs_path: Utf8PathBuf,
+        subs_path: &Utf8PathBuf,
         schema: &Schema,
         state_conn: &Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
@@ -611,6 +666,7 @@ impl Matcher {
         };
 
         let conn = Connection::open(&sub_db_path)?;
+        trace_heavy_queries_subs(&conn)?;
         conn.execute_batch(
             r#"
                 PRAGMA journal_mode = WAL;
@@ -819,9 +875,15 @@ impl Matcher {
                 cached_statements: statements.clone(),
                 subs_path: sub_path.to_string(),
                 metrics: counter_map,
+                processing_stats: Arc::new(Mutex::new(ProcessingStats {
+                    ema_ms_per_sec: 0.0,
+                    last_process_time: None,
+                })),
             }),
             state: state.clone(),
         };
+
+        let processing_stats = handle.inner.processing_stats.clone();
 
         let matcher = Self {
             id,
@@ -840,6 +902,7 @@ impl Matcher {
             last_change_tx,
             changes_rx,
             purge_rx,
+            processing_stats,
         };
 
         Ok((matcher, handle))
@@ -910,9 +973,16 @@ impl Matcher {
             }
         })?;
 
-        let (matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, &sql)?;
+        let (matcher, handle) = Self::new(id, &subs_path, schema, &state_conn, evt_tx, &sql)?;
 
-        spawn_counted(matcher.run_restore(state_conn, tripwire));
+        spawn_counted(async move {
+            if let Err(e) = matcher.run_restore(state_conn, tripwire).await {
+                error!(sub_id = %id, "could not run restore: {e}");
+                if let Err(e) = Self::cleanup(id, Matcher::sub_path(&subs_path, id)) {
+                    error!(sub_id = %id, "could not cleanup: {e}");
+                }
+            }
+        });
 
         Ok(handle)
     }
@@ -927,7 +997,7 @@ impl Matcher {
         sql: &str,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
-        let (mut matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
+        let (mut matcher, handle) = Self::new(id, &subs_path, schema, &state_conn, evt_tx, sql)?;
 
         let pk_cols = matcher
             .pks
@@ -1028,14 +1098,25 @@ impl Matcher {
             Ok::<_, MatcherError>(())
         })?;
 
-        spawn_counted(matcher.run(state_conn, tripwire));
+        spawn_counted(async move {
+            if let Err(e) = matcher.run(state_conn, tripwire).await {
+                error!(sub_id = %id, "could not setup subscription: {e}");
+                if let Err(e) = Self::cleanup(id, Matcher::sub_path(&subs_path, id)) {
+                    error!(sub_id = %id, "could not cleanup: {e}");
+                }
+            }
+        });
 
         Ok(handle)
     }
 
-    async fn run_restore(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
+    async fn run_restore(
+        mut self,
+        mut state_conn: CrConn,
+        tripwire: Tripwire,
+    ) -> Result<(), MatcherError> {
         info!(sub_id = %self.id, "Restoring subscription");
-        let init_res = block_in_place(|| {
+        block_in_place(|| {
             self.last_rowid = self
                 .conn
                 .query_row(
@@ -1054,24 +1135,13 @@ impl Matcher {
             _ = self.last_change_tx.send(max_change_id);
 
             Ok::<_, MatcherError>(())
-        });
+        })?;
 
-        if let Err(e) = init_res {
-            error!(sub_id = %self.id, "could not re-initialize subscription: {e}");
-            return;
-        }
+        block_in_place(|| self.setup(&mut state_conn))?;
+        self.set_status("running")?;
 
-        if let Err(e) = block_in_place(|| self.setup(&mut state_conn)) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
-            return;
-        }
-
-        if let Err(e) = self.set_status("running") {
-            error!(sub_id = %self.id, "could not set status: {e}");
-            return;
-        }
-
-        self.cmd_loop(state_conn, tripwire).await
+        self.cmd_loop(state_conn, tripwire).await;
+        Ok(())
     }
 
     fn set_status(&self, status: &str) -> Result<(), MatcherError> {
@@ -1215,6 +1285,8 @@ impl Matcher {
                     }
                     let elapsed = start.elapsed();
 
+                    self.processing_stats.lock().record(elapsed);
+
                     histogram!("corro.subs.changes.processing.duration.seconds", "sql_hash" => self.hash.clone()).record(elapsed);
 
                     if elapsed >= PROCESSING_WARN_THRESHOLD {
@@ -1271,6 +1343,7 @@ impl Matcher {
                 return;
             }
             let elapsed = start.elapsed();
+            self.processing_stats.lock().record(elapsed);
             info!(sub_id = %self.id, "handled final buffered candidates in {elapsed:?}");
         }
 
@@ -1281,16 +1354,13 @@ impl Matcher {
         info!(sub_id = %self.id, "matcher loop is done");
     }
 
-    async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
+    async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) -> Result<(), MatcherError> {
         info!(sub_id = %self.id, "Running initial query");
-        if let Err(e) = self
-            .evt_tx
+
+        self.evt_tx
             .send(QueryEvent::Columns(self.col_names.clone()))
             .await
-        {
-            error!(sub_id = %self.id, "could not send back columns, probably means no receivers! {e}");
-            return;
-        }
+            .map_err(|_| MatcherError::EventReceiverClosed)?;
 
         let mut query_cols = vec![];
         for i in 0..(self.parsed.columns.len()) {
@@ -1422,36 +1492,31 @@ impl Matcher {
                     "done w/ block_in_place for initial query, elapsed: {:?}",
                     elapsed
                 );
-                if let Err(e) = self
-                    .evt_tx
+                self.evt_tx
                     .send(QueryEvent::EndOfQuery {
                         time: elapsed.as_secs_f64(),
                         change_id: Some(ChangeId(0)),
                     })
                     .await
-                {
-                    error!(sub_id = %self.id, "could not return end of query event: {e}");
-                    return;
-                }
+                    .map_err(|_| MatcherError::EventReceiverClosed)?;
                 // db_version
             }
             Err(e) => {
                 warn!(sub_id = %self.id, "could not complete initial query: {e}");
-                _ = self
-                    .evt_tx
+                self.evt_tx
                     .send(QueryEvent::Error(e.to_compact_string()))
-                    .await;
+                    .await
+                    .map_err(|_| MatcherError::EventReceiverClosed)?;
 
-                return;
+                return Err(e);
             }
         };
 
-        if let Err(e) = block_in_place(|| self.setup(&mut state_conn)) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
-            return;
-        }
+        block_in_place(|| self.setup(&mut state_conn))?;
 
-        self.cmd_loop(state_conn, tripwire).await
+        self.cmd_loop(state_conn, tripwire).await;
+
+        Ok(())
     }
 
     fn handle_candidates(
@@ -2524,7 +2589,7 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1))).await?;
+        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1)), -1048576).await?;
         let clock = Arc::new(uhlc::HLC::default());
 
         {
@@ -2644,7 +2709,7 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)))
+        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), -1048576)
             .await
             .unwrap();
         let mut conn = pool.write_priority().await.unwrap();

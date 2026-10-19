@@ -22,10 +22,13 @@ use tripwire::Tripwire;
 use uuid::Uuid;
 
 use crate::{
-    agent::process_multiple_changes,
+    agent::{
+        process_multiple_changes, setup,
+        util::{apply_buffered_version_in_chunks, execute_schema, execute_schema_from_paths},
+    },
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions, TimeoutParams},
+        public::{api_v1_transactions, TimeoutParams},
     },
     transport::Transport,
 };
@@ -34,26 +37,112 @@ use corro_types::change::Change;
 use corro_types::{
     actor::{ActorId, MemberId},
     api::{ExecResponse, ExecResult, Statement},
-    base::{dbsr, dbsri, dbvri, CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
+    base::{dbsr, dbsri, dbvri, CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     broadcast::{ChangeSource, ChangeV1, Changeset},
+    config::Config,
     sync::generate_sync,
 };
 use corro_types::{
     agent::Agent,
     api::{ColumnName, TableName},
     change::row_to_change,
+    config::BroadcastMethod,
     pubsub::pack_columns,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-
-async fn insert_rows_and_gossip() -> eyre::Result<()> {
+async fn http_api_requested_endpoint_name_header_enforced() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta1 = launch_test_agent(
+        |conf| conf.endpoint_name("us-east-1").build(),
+        tripwire.clone(),
+    )
+    .await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    let client = reqwest::Client::new();
+    let req_body_1: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_001, "endpoint header test 1"]
+    ]]))?;
+    let req_body_2: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_002, "endpoint header test 2"]
+    ]]))?;
+    let req_body_3: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_003, "endpoint header test 3"]
+    ]]))?;
+    let req_body_4: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_004, "endpoint header test 4"]
+    ]]))?;
+
+    // No X-Corrosion-Requested-Endpoint-Name: accept all requests
+    let no_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&req_body_1)?)
+        .send()
+        .await?;
+    assert_eq!(no_header_res.status(), StatusCode::OK);
+
+    // w/ X-Corrosion-Requested-Endpoint-Name, matching
+    let matching_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-endpoint-name", "us-east-1")
+        .body(serde_json::to_vec(&req_body_2)?)
+        .send()
+        .await?;
+    assert_eq!(matching_header_res.status(), StatusCode::OK);
+
+    // w/ X-Corrosion-Requested-Endpoint-Name, mismatching
+    let mismatched_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-endpoint-name", "eu-west-1")
+        .body(serde_json::to_vec(&req_body_3)?)
+        .send()
+        .await?;
+    assert_eq!(
+        mismatched_header_res.status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+
+    // Endpoint header is ignored if node has no endpoint name configured
+    let header_ignored_when_unconfigured_res = client
+        .post(format!("http://{}/v1/transactions", ta2.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-endpoint-name", "eu-west-1")
+        .body(serde_json::to_vec(&req_body_4)?)
+        .send()
+        .await?;
+    assert_eq!(
+        header_ignored_when_unconfigured_res.status(),
+        StatusCode::OK
+    );
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+async fn insert_rows_and_broadcast(method: BroadcastMethod) -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(
+        |conf| conf.broadcast_method(method).build(),
+        tripwire.clone(),
+    )
+    .await?;
     let ta2 = launch_test_agent(
         |conf| {
-            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+            conf.broadcast_method(method)
+                .bootstrap(vec![ta1.agent.gossip_addr().to_string()])
                 .build()
         },
         tripwire.clone(),
@@ -249,19 +338,40 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn insert_rows_and_gossip() -> eyre::Result<()> {
+    insert_rows_and_broadcast(BroadcastMethod::Gossip).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn insert_rows_and_plumtree() -> eyre::Result<()> {
+    insert_rows_and_broadcast(BroadcastMethod::Plumtree).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn chill_test() -> eyre::Result<()> {
-    configurable_stress_test(2, 1, 4).await
+    configurable_stress_test(2, 1, 4, BroadcastMethod::Gossip).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stress_test() -> eyre::Result<()> {
-    configurable_stress_test(30, 10, 200).await
+    configurable_stress_test(30, 10, 200, BroadcastMethod::Gossip).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stress_plumtree_test() -> eyre::Result<()> {
+    configurable_stress_test(30, 10, 200, BroadcastMethod::Plumtree).await
 }
 
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stresser_test() -> eyre::Result<()> {
-    configurable_stress_test(45, 15, 1500).await
+    configurable_stress_test(45, 15, 1500, BroadcastMethod::Gossip).await
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stresser_plumtree_test() -> eyre::Result<()> {
+    configurable_stress_test(45, 15, 1500, BroadcastMethod::Plumtree).await
 }
 
 /// Default parameters:
@@ -276,6 +386,7 @@ pub async fn configurable_stress_test(
     num_nodes: usize,
     connectivity: usize,
     input_count: usize,
+    method: BroadcastMethod,
 ) -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -300,6 +411,7 @@ pub async fn configurable_stress_test(
                         launch_test_agent(
                             |conf| {
                                 conf.gossip_addr(gossip_addr)
+                                    .broadcast_method(method)
                                     .bootstrap(
                                         bootstrap
                                             .iter()
@@ -406,45 +518,13 @@ pub async fn configurable_stress_test(
 
     println!("expecting {changes_count} ops");
 
-    // tokio::spawn({
-    //     let bookies = agents
-    //         .iter()
-    //         .map(|a| (a.agent.actor_id(), a.bookie.clone()))
-    //         .collect::<Vec<_>>();
-    //     async move {
-    //         loop {
-    //             tokio::time::sleep(Duration::from_secs(1)).await;
-    //             for (actor_id, bookie) in bookies.iter() {
-    //                 let registry = bookie.registry();
-    //                 let r = registry.map.read();
-
-    //                 for v in r.values() {
-    //                     debug!(%actor_id, "GOT A LOCK {v:?}");
-    //                 }
-    //             }
-    //         }
-    //     }
-    // });
-
     let start = Instant::now();
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         debug!("looping");
-        for ta in agents.iter() {
-            let registry = ta.bookie.registry();
-            let r = registry.map.read();
 
-            for v in r.values() {
-                println!(
-                    "{}: GOT A LOCK: {} has been locked for {:?}",
-                    ta.agent.actor_id(),
-                    v.label,
-                    v.started_at.elapsed()
-                );
-            }
-        }
         tokio::time::sleep(Duration::from_secs(1)).await;
         println!("checking status after {}s", start.elapsed().as_secs_f32());
         let mut v = vec![];
@@ -466,13 +546,7 @@ pub async fn configurable_stress_test(
 
             debug!(
                 "last version: {:?}",
-                ta.bookie
-                    .write::<&str, _>("test", None)
-                    .await
-                    .ensure(ta.agent.actor_id())
-                    .read::<&str, _>("test", None)
-                    .await
-                    .last()
+                ta.bookie.ensure(ta.agent.actor_id()).read().last()
             );
 
             let sync = generate_sync(&ta.bookie, ta.agent.actor_id()).await;
@@ -702,14 +776,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!(
             "{name}: bookie: {:?}",
-            ta.bookie
-                .read::<&str, _>("test", None)
-                .await
-                .get(&ta1.agent.actor_id())
-                .unwrap()
-                .read::<&str, _>("test", None)
-                .await
-                .deref()
+            ta.bookie.get(&ta1.agent.actor_id()).unwrap().read().deref()
         );
 
         if count as usize != expected_count {
@@ -768,21 +835,6 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
 
     let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
     let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-
-    assert_eq!(status_code, StatusCode::OK);
-
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
@@ -855,21 +907,8 @@ async fn process_failed_changes() -> eyre::Result<()> {
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let uuid = Uuid::parse_str("00000000-0000-0000-a716-446655440000")?;
     let actor_id = ActorId(uuid);
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     for i in 1..=5_i64 {
         let (status_code, _) = api_v1_transactions(
@@ -976,22 +1015,6 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let tx_timeout = Duration::from_secs(60);
 
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-
-    assert_eq!(status_code, StatusCode::OK);
-
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
-
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
 
@@ -1087,6 +1110,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     .await?;
 
     // sent 1-25
+    println!("processing cleared versions 21-25");
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
@@ -1123,12 +1147,8 @@ async fn check_bookie_versions(
     cleared: Vec<RangeInclusive<CrsqlDbVersion>>,
 ) -> eyre::Result<()> {
     let conn = ta.agent.pool().read().await?;
-    let booked = ta
-        .bookie
-        .write::<&str, _>("test", None)
-        .await
-        .ensure(actor_id);
-    let bookedv = booked.read::<&str, _>("test", None).await;
+    let booked = ta.bookie.ensure(actor_id);
+    let bookedv = booked.read();
 
     for versions in complete {
         for version in CrsqlDbVersionRange::from(versions.clone()) {
@@ -1172,7 +1192,8 @@ async fn check_bookie_versions(
         }
         assert!(conn.prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and start = ? and end = ?)")?
-            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?);
+            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?,
+        "missing gap {versions:?} in __corro_bookkeeping_gaps table");
     }
 
     for versions in cleared {
@@ -1490,6 +1511,331 @@ async fn test_diff_member_id() -> eyre::Result<()> {
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_execute_schema_from_paths() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    let schema_dir = ta.tmpdir.path().join("schema");
+    let extra_sql = r#"
+CREATE TABLE IF NOT EXISTS test_reload (
+    id INTEGER NOT NULL PRIMARY KEY,
+    note TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS test_reload2 (
+    id INTEGER NOT NULL PRIMARY KEY
+) WITHOUT ROWID;
+"#;
+    tokio::fs::write(schema_dir.join("extra.sql"), extra_sql.as_bytes()).await?;
+
+    let index_sql = r#"
+    CREATE INDEX IF NOT EXISTS test_reload_note_idx ON test_reload (note);
+    "#;
+    tokio::fs::write(schema_dir.join("index.sql"), index_sql.as_bytes()).await?;
+
+    execute_schema_from_paths(&ta.agent).await?;
+
+    let conn = ta.agent.pool().read().await?;
+    assert!(check_obj_exists(&conn, "table", "test_reload"));
+    assert!(check_obj_exists(&conn, "table", "test_reload2"));
+    assert!(check_obj_exists(&conn, "index", "test_reload_note_idx"));
+
+    {
+        let schema = ta.agent.schema().read();
+        assert!(schema.tables.get("test_reload").is_some());
+        assert!(schema.tables.get("test_reload2").is_some());
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+fn check_obj_exists(conn: &rusqlite::Connection, obj_type: &str, obj_name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ? AND name = ?)",
+        [obj_type, obj_name],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_apply_buffered_version_in_chunks() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let dir = tempfile::tempdir()?;
+    let (agent, _opts) = setup(
+        Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?,
+        tripwire.clone(),
+    )
+    .await?;
+    execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+    let bookie = agent.bookie().clone();
+
+    let actor_id = ActorId(Uuid::new_v4());
+    let ts = agent.clock().new_timestamp().into();
+    let last_seq = 999u64;
+    let changes: Vec<_> = (0..=last_seq)
+        .map(|i| Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![(i as i64 + 1).into()]).unwrap(),
+            cid: ColumnName("text".into()),
+            val: format!("row-{i}").into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(i),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        })
+        .collect();
+
+    let mid = last_seq.div_ceil(2);
+    process_multiple_changes(
+        agent.clone(),
+        bookie.clone(),
+        vec![
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(1),
+                        changes: changes[..mid as usize].to_vec(),
+                        seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(mid - 1)),
+                        last_seq: CrsqlSeq(last_seq),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            ),
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(1),
+                        changes: changes[mid as usize..].to_vec(),
+                        seqs: CrsqlSeqRange::new(CrsqlSeq(mid), CrsqlSeq(last_seq)),
+                        last_seq: CrsqlSeq(last_seq),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            ),
+        ],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&CrsqlDbVersion(1)).unwrap().is_complete());
+    }
+
+    let (progress_tx, mut progress_rx) = mpsc::channel(128);
+    let total = apply_buffered_version_in_chunks(
+        &agent,
+        &bookie,
+        actor_id,
+        CrsqlDbVersion(1),
+        10,
+        Some(progress_tx),
+    )
+    .await?
+    .expect("version should be fully buffered");
+    assert_eq!(total, 1000);
+
+    let mut progress = Vec::new();
+    while let Ok(p) = progress_rx.try_recv() {
+        progress.push(p);
+    }
+    assert_eq!(progress.len(), 100);
+    assert_eq!(progress[0].seq_start, CrsqlSeq(0));
+    assert_eq!(progress[0].seq_end, CrsqlSeq(9));
+    assert_eq!(progress[99].seq_start, CrsqlSeq(990));
+    assert_eq!(progress[99].seq_end, CrsqlSeq(999));
+
+    {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&CrsqlDbVersion(1)).is_none());
+        assert!(read.contains_version(&CrsqlDbVersion(1)));
+    }
+
+    let conn = agent.pool().read().await?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM tests", [], |row| row.get(0))?;
+    assert_eq!(count, 1000);
+
+    let again =
+        apply_buffered_version_in_chunks(&agent, &bookie, actor_id, CrsqlDbVersion(1), 2, None)
+            .await?;
+    assert_eq!(again, None);
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_schema_change_retries_all_fully_buffered_partials() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let dir = tempfile::tempdir()?;
+
+    let mut config = Config::builder()
+        .db_path(dir.path().join("corrosion.db").display().to_string())
+        .gossip_addr("127.0.0.1:0".parse()?)
+        .api_addr("127.0.0.1:0".parse()?)
+        .build()?;
+
+    config.perf.partial_retries = 3;
+
+    let (agent, opts) = setup(config, tripwire.clone()).await?;
+    let bookie = agent.bookie().clone();
+    let mut rx_apply = opts.rx_apply;
+
+    let actor_a = ActorId(Uuid::new_v4());
+    let actor_b = ActorId(Uuid::new_v4());
+    let version = CrsqlDbVersion(1);
+    let ts = agent.clock().new_timestamp().into();
+
+    let make_part = |actor_id: ActorId, seq: u64, id: i64, text: &str| {
+        (
+            ChangeV1 {
+                actor_id,
+                changeset: Changeset::Full {
+                    version,
+                    changes: vec![Change {
+                        table: TableName("retry_after_schema_change".into()),
+                        pk: pack_columns(&vec![id.into()]).unwrap(),
+                        cid: ColumnName("text".into()),
+                        val: text.to_owned().into(),
+                        col_version: 1,
+                        db_version: version,
+                        seq: CrsqlSeq(seq),
+                        site_id: actor_id.to_bytes(),
+                        cl: 1,
+                    }],
+                    seqs: CrsqlSeqRange::new(CrsqlSeq(seq), CrsqlSeq(seq)),
+                    last_seq: CrsqlSeq(1),
+                    ts,
+                },
+            },
+            ChangeSource::Sync,
+            Instant::now(),
+        )
+    };
+
+    process_multiple_changes(
+        agent.clone(),
+        bookie.clone(),
+        vec![
+            make_part(actor_a, 0, 1, "a-first"),
+            make_part(actor_a, 1, 2, "a-second"),
+            make_part(actor_b, 0, 3, "b-first"),
+            make_part(actor_b, 1, 4, "b-second"),
+        ],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    for actor_id in [actor_a, actor_b] {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&version).unwrap().is_complete());
+    }
+
+    for _ in 0..2 {
+        let initial_apply = timeout(Duration::from_secs(1), rx_apply.recv()).await?;
+        assert!(initial_apply.is_some());
+    }
+
+    for actor_id in [actor_a, actor_b] {
+        let result = crate::agent::util::process_fully_buffered_changes(
+            &agent,
+            &bookie,
+            actor_id,
+            version,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    let apply_loop = tokio::spawn(crate::agent::util::apply_fully_buffered_changes_loop(
+        agent.clone(),
+        bookie.clone(),
+        rx_apply,
+        tripwire.clone(),
+    ));
+
+    tokio::task::yield_now().await;
+
+    execute_schema(
+        &agent,
+        vec![r#"
+            CREATE TABLE retry_after_schema_change (
+                id INTEGER NOT NULL PRIMARY KEY,
+                text TEXT NOT NULL DEFAULT ''
+            ) WITHOUT ROWID;
+            "#
+        .to_owned()],
+    )
+    .await?;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let count: i64 = agent
+                .pool()
+                .read()
+                .await
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM retry_after_schema_change",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            if count == 4 {
+                break;
+            }
+
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("schema change should retry all fully buffered partials");
+
+    for actor_id in [actor_a, actor_b] {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&version).is_none());
+        assert!(read.contains_version(&version));
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    apply_loop.await?;
     wait_for_all_pending_handles().await;
 
     Ok(())

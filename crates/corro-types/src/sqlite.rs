@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -24,7 +25,21 @@ pub type SqlitePoolError = sqlite_pool::PoolError;
 // Global registry for query stats
 // (sql, readonly) => (total_count, total_nanos)
 type QueryStats = HashMap<(String, bool), (u64, u128)>;
+type InFlightQueries = HashMap<String, Instant>;
 static QUERY_STATS: ThreadLocal<Mutex<QueryStats>> = ThreadLocal::new();
+pub static IN_FLIGHT_QUERIES: ThreadLocal<Mutex<InFlightQueries>> = ThreadLocal::new();
+
+// Aggregate stats for subscription matcher connections (no per-query breakdown)
+static SUBS_QUERY_STATS: ThreadLocal<Mutex<(u64, u128)>> = ThreadLocal::new(); // (count, nanos)
+
+// Flags for tracking crsql_changes application scope (RW connection only)
+static IN_CHANGES_SCOPE: AtomicBool = AtomicBool::new(false);
+static IN_DATA_MODE: AtomicBool = AtomicBool::new(false);
+
+// Per-thread stats for data vs metadata during crsql_changes application
+static CHANGES_DATA_STATS: ThreadLocal<Mutex<(u64, u128)>> = ThreadLocal::new(); // (count, nanos)
+static CHANGES_META_STATS: ThreadLocal<Mutex<(u64, u128)>> = ThreadLocal::new();
+
 pub async fn query_metrics_loop(mut tripwire: Tripwire) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     let mut prev_tick = interval.tick().await;
@@ -34,6 +49,8 @@ pub async fn query_metrics_loop(mut tripwire: Tripwire) {
             let elapsed = t.duration_since(prev_tick);
             prev_tick = t;
             handle_query_metrics(elapsed);
+            handle_subs_query_metrics();
+            handle_changes_metrics();
             },
             _ = &mut tripwire => break,
         }
@@ -117,35 +134,128 @@ fn tracing_callback_rw(ev: rusqlite::trace::TraceEvent) {
     handle_sql_tracing_event(ev, false);
 }
 
-fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
-    if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = ev {
-        let dur = duration.as_nanos();
-        let sql = stmt_ref.sql().to_string();
+fn is_crsql_changes_insert(sql: &str) -> bool {
+    let lower = sql.to_lowercase();
+    lower.contains("insert") && lower.contains("crsql_changes")
+}
 
-        // Update per-thread stats to avoid contention on hot path
-        let stats_mutex = QUERY_STATS.get_or_default();
-        let mut stats = stats_mutex.lock();
-        let entry = stats
-            .entry((sql.clone(), readonly))
-            .or_insert((0u64, 0u128));
-        entry.0 += 1;
-        entry.1 += dur;
-        drop(stats); // Release lock quickly
-
-        if duration >= SLOW_QUERY_THRESHOLD {
-            warn!(
-                "SLOW {} query {duration:?} => {}",
-                if readonly { "RO" } else { "RW" },
-                sql
-            );
-        }
+/// Returns `Some(true)` for `crsql_internal_sync_bit(1)`,
+/// `Some(false)` for `crsql_internal_sync_bit(0)`,
+/// `None` if not a sync_bit call.
+fn sync_bit_value(sql: &str) -> Option<bool> {
+    let lower = sql.to_lowercase();
+    if lower.contains("crsql_internal_sync_bit(1)") {
+        Some(true)
+    } else if lower.contains("crsql_internal_sync_bit(0)") {
+        Some(false)
+    } else {
+        None
     }
+}
+
+fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
+    match ev {
+        rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) => {
+            let dur = duration.as_nanos();
+            let sql = stmt_ref.sql().to_string();
+
+            // Update per-thread stats to avoid contention on hot path
+            let stats_mutex = QUERY_STATS.get_or_default();
+            let mut stats = stats_mutex.lock();
+            let entry = stats
+                .entry((sql.clone(), readonly))
+                .or_insert((0u64, 0u128));
+            entry.0 += 1;
+            entry.1 += dur;
+            drop(stats); // Release lock quickly
+
+            // Classify data vs metadata during crsql_changes application (RW only)
+            if !readonly {
+                if is_crsql_changes_insert(&sql) {
+                    // Outer INSERT statement completes - reset scope.
+                    // Skip counting this statement: its duration includes all substatements.
+                    IN_CHANGES_SCOPE.store(false, Ordering::Relaxed);
+                    IN_DATA_MODE.store(false, Ordering::Relaxed);
+                } else if IN_CHANGES_SCOPE.load(Ordering::Relaxed) {
+                    if sync_bit_value(&sql).is_some() {
+                        // sync_bit calls are always metadata
+                        let meta = CHANGES_META_STATS.get_or_default();
+                        let mut m = meta.lock();
+                        m.0 += 1;
+                        m.1 += dur;
+                    } else if IN_DATA_MODE.load(Ordering::Relaxed) {
+                        let data = CHANGES_DATA_STATS.get_or_default();
+                        let mut d = data.lock();
+                        d.0 += 1;
+                        d.1 += dur;
+                    } else {
+                        let meta = CHANGES_META_STATS.get_or_default();
+                        let mut m = meta.lock();
+                        m.0 += 1;
+                        m.1 += dur;
+                    }
+                }
+            }
+
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.remove(&sql);
+            drop(inflight_queries);
+
+            if duration >= SLOW_QUERY_THRESHOLD {
+                warn!(
+                    "SLOW {} query {duration:?} => {}",
+                    if readonly { "RO" } else { "RW" },
+                    sql
+                );
+            }
+        }
+        rusqlite::trace::TraceEvent::Stmt(_, sql) => {
+            // Track crsql_changes scope and sync_bit mode (RW only)
+            if !readonly {
+                if is_crsql_changes_insert(sql) {
+                    IN_CHANGES_SCOPE.store(true, Ordering::Relaxed);
+                    IN_DATA_MODE.store(false, Ordering::Relaxed);
+                } else if let Some(val) = IN_CHANGES_SCOPE
+                    .load(Ordering::Relaxed)
+                    .then(|| sync_bit_value(sql))
+                    .flatten()
+                {
+                    IN_DATA_MODE.store(val, Ordering::Relaxed);
+                }
+            }
+
+            // skip trigger for subprograms.
+            if sql.starts_with("--") {
+                return;
+            }
+            let start_time = Instant::now();
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.insert(sql.to_string(), start_time);
+        }
+        _ => {}
+    }
+}
+
+pub fn log_slow_inflight_queries() {
+    let mut aggregated = HashMap::new();
+    for queries_mu in IN_FLIGHT_QUERIES.iter() {
+        let inflight_queries = queries_mu.lock().clone();
+        aggregated.extend(inflight_queries.into_iter());
+    }
+    aggregated.iter().for_each(|(sql, start_time)| {
+        let elapsed = start_time.elapsed();
+        if elapsed > SLOW_QUERY_THRESHOLD {
+            warn!("SLOW in-progress query: {sql} - time since start: {elapsed:?}");
+        }
+    });
 }
 
 pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
     let readonly = conn.is_readonly(MAIN_DB)?;
     conn.trace_v2(
-        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        TraceEventCodes::SQLITE_TRACE_PROFILE | TraceEventCodes::SQLITE_TRACE_STMT,
         Some(if readonly {
             tracing_callback_ro
         } else {
@@ -155,9 +265,91 @@ pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+/// Install tracing on a connection used by subscription matchers.
+/// Writes to a separate SUBS_QUERY_STATS so subs sqlite time is
+/// bucketed into `corro.subs.db.query.ms` / `corro.subs.db.query.count`
+/// instead of the general `corro.db.query.*` metrics.
+pub fn trace_heavy_queries_subs(conn: &Connection) -> rusqlite::Result<()> {
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(tracing_callback_subs),
+    );
+    Ok(())
+}
+
+fn tracing_callback_subs(ev: rusqlite::trace::TraceEvent) {
+    if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = ev {
+        let dur = duration.as_nanos();
+        let sql = stmt_ref.sql().to_string();
+
+        let stats_mutex = SUBS_QUERY_STATS.get_or_default();
+        let mut stats = stats_mutex.lock();
+        stats.0 += 1;
+        stats.1 += dur;
+
+        if duration >= SLOW_QUERY_THRESHOLD {
+            drop(stats);
+            warn!("SLOW SUBS query {duration:?} => {sql}");
+        }
+    }
+}
+
+fn handle_subs_query_metrics() {
+    let mut total_count = 0u64;
+    let mut total_nanos = 0u128;
+
+    for stats_mutex in SUBS_QUERY_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        total_count += stats.0;
+        total_nanos += stats.1;
+        *stats = (0, 0);
+    }
+
+    let total_ms = (total_nanos / 1_000_000) as u64;
+    counter!("corro.subs.db.query.ms").increment(total_ms);
+    counter!("corro.subs.db.query.count").increment(total_count);
+}
+
+fn handle_changes_metrics() {
+    let mut data_count = 0u64;
+    let mut data_nanos = 0u128;
+    for stats_mutex in CHANGES_DATA_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        data_count += stats.0;
+        data_nanos += stats.1;
+        *stats = (0, 0);
+    }
+
+    let mut meta_count = 0u64;
+    let mut meta_nanos = 0u128;
+    for stats_mutex in CHANGES_META_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        meta_count += stats.0;
+        meta_nanos += stats.1;
+        *stats = (0, 0);
+    }
+
+    let data_ms = (data_nanos / 1_000_000) as u64;
+    let meta_ms = (meta_nanos / 1_000_000) as u64;
+    counter!("corro.db.crsql_changes.data.ms").increment(data_ms);
+    counter!("corro.db.crsql_changes.data.count").increment(data_count);
+    counter!("corro.db.crsql_changes.metadata.ms").increment(meta_ms);
+    counter!("corro.db.crsql_changes.metadata.count").increment(meta_count);
+}
+
+pub fn rusqlite_to_crsqlite_write(
+    conn: rusqlite::Connection,
+    cache_size_kib: i64,
+) -> rusqlite::Result<CrConn> {
     let conn = rusqlite_to_crsqlite(conn)?;
-    conn.execute_batch("PRAGMA cache_size = -32000;")?;
+    conn.execute_batch(&format!(
+        "
+        PRAGMA cache_size = {};
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_spill = FALSE;
+        ",
+        cache_size_kib
+    ))?;
 
     Ok(conn)
 }

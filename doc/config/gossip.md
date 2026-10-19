@@ -34,6 +34,29 @@ It can resolve names w/ a custom DNS server:
 bootstrap = ["my-fly-app.internal:3333@[fdaa::3]:53"]
 ```
 
+#### `gossip.allow_mixed_ip`
+
+When `true`, bootstrap from both IPv4 and IPv6 peers even if this node's `gossip.addr` is the other family. Defaults to `false`, which only considers same-family addresses.
+
+Sending to both families requires a matching outgoing socket (`gossip.client_addr_v4` / `gossip.client_addr_v6`) or a single `client_addr = "[::]:0"`.
+
+#### `gossip.client_addr`
+
+Bind address for outgoing QUIC connections. Defaults to `[::]:0` when neither family-specific bind is set.
+Port `0` opens 8 sockets to reduce kernel buffer pressure; a non-zero port uses a single socket.
+
+Mutually exclusive with `client_addr_v4` / `client_addr_v6`. Setting both styles is a config error.
+
+#### `gossip.client_addr_v4` / `gossip.client_addr_v6`
+
+Optional per-family binds for outgoing QUIC. Set either or both instead of `client_addr`. At send time, Corrosion picks the pool that matches the destination address family. A destination with no matching socket fails rather than mapping IPv4 onto an IPv6 socket.
+
+```toml
+# Mixed IPv4/IPv6 cluster: do not set client_addr
+client_addr_v4 = "0.0.0.0:0"
+client_addr_v6 = "[fdaa:2::1]:0"
+```
+
 #### `gossip.plaintext`
 
 Allows using QUIC without encryption. The only reason to set this to `true` is if you're running a toy cluster or if the underlying transport is already handling cryptography (such as WireGuard) AND authorization is bound by the network (such is the case for a [Fly.io](https://fly.io) app's private network).
@@ -61,6 +84,46 @@ This should be your "effective" MTU: `network interface's MTU - IP header size -
 #### `gossip.disable_gso`
 
 Certain environments don't support GSO (Generic Segmentation Offload). This is detected by the QUIC implementation, but it's possible to pre-emptively disable it to avoid re-trying the initial packets without GSO as it is detected as unavailable.
+
+#### `gossip.broadcast`
+
+Selects the algorithm used to disseminate changes across the cluster. Please note that all nodes in a cluster need to use the same broadcast
+algorithm.
+
+Two methods are available:
+
+- `gossip` (**default**): SWIM-style gossip. Each change is re-broadcast to a random subset of peers. Robust and simple, but every hop carries the full payload, so bandwidth grows with cluster size.
+- `plumtree`: [Plumtree](https://asc.di.fct.unl.pt/~jleitao/pdf/srds07-leitao.pdf) epidemic broadcast. Nodes build a spanning tree of "eager" peers that forward full payloads, while the remaining "lazy" peers only exchange lightweight `IHave` announcements and pull (`GRAFT`) the payload on demand. This cuts redundant payload traffic on larger clusters, at the cost of some protocol complexity.
+
+If unset, Corrosion uses `gossip`. To enable Plumtree, add a `[gossip.broadcast.plumtree]` table. All of its fields are optional and fall back to the defaults below:
+
+```toml
+[gossip.broadcast.plumtree]
+prune_threshold = 5         # optional
+optimization_threshold = 7  # optional; omit to disable
+batch_gossip = false        # optional
+ring_locked_radius = 1      # optional; 1 → 2 locked peers, 2 → 4
+```
+
+##### `prune_threshold`
+
+Number of times a message may be received from the same eager peer before that peer is pruned (moved from the eager set to the lazy set with a `PRUNE`). Duplicate deliveries mean the tree has a redundant edge, so pruning trims it.
+
+Higher values tolerate more duplication in exchange for a more stable tree; lower values prune more aggressively, reducing redundant payload traffic but causing more tree churn. Defaults to `5`.
+
+##### `optimization_threshold`
+
+Threshold, in gossip rounds, for switching to a shorter path. When a node learns via a lazy `IHave` that a peer could have delivered a message at least this many rounds sooner than the eager peer that actually delivered it, it grafts the shorter path.
+
+Lower values optimize the tree more aggressively (more `GRAFT` churn); higher values leave the tree alone unless the improvement is large. Unset by default, which disables optimization grafts. Set an explicit value to enable them.
+
+##### `batch_gossip`
+
+When `true`, coalesce multiple outgoing Plumtree gossip and membership messages instead of sending each one individually. Reduces per-packet overhead on busy clusters at the cost of a small amount of added latency. Defaults to `false`.
+
+##### `ring_locked_radius`
+
+Number of identity-ring neighbors locked eager on each side of this node. Those peers are never pruned, so the node cannot be isolated from the tree. Total locked peers is `2 * radius`. Defaults to `1` (two locked peers). Raise it on larger clusters if a single pair of ring neighbors is not enough to keep the tree connected.
 
 #### `gossip.tls`
 
@@ -94,9 +157,17 @@ addr = "" # required, no default value
 
 bootstrap = []
 
-plaintext = false  # optional
-max_mtu = 1200  # optional
-disable_gso = false  # optional
+plaintext = false           # optional
+idle_timeout_secs = 30      # optional
+disable_gso = false         # optional
+allow_mixed_ip = false      # optional
+
+# client_addr    = "[::]:0"     # optional; mutually exclusive with the two below
+# client_addr_v4 = "0.0.0.0:0"  # optional
+# client_addr_v6 = "[::]:0"     # optional
+
+# max_mtu = 1452            # optional; unset = autodetect, must be >= 1200
+# external_addr = ""        # optional, defaults to gossip.addr
 
 member_id = 1 # optional
 

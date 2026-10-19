@@ -2,24 +2,27 @@
 
 use std::time::Instant;
 
-use crate::api::public::execute_schema;
+use crate::agent::util::execute_schema_from_paths;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
-        metrics, setup, util, AgentOptions,
+        metrics,
+        reaper::spawn_reaper,
+        setup, util, AgentOptions,
     },
-    broadcast::runtime_loop,
+    broadcast::{handle_broadcasts, runtime_loop, BroadcastOpts},
+    plumtree::spawn_plumtree_loop,
     transport::Transport,
 };
+
 use corro_types::{
-    actor::ActorId,
-    agent::{Agent, BookedVersions, Bookie},
+    agent::{Agent, ApplyTrigger, Bookie},
     base::CrsqlSeq,
     channel::bounded,
-    config::{Config, PerfConfig},
+    config::{BroadcastMethod, Config, PerfConfig},
 };
 
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::FutureExt;
 use spawn::spawn_counted;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -51,12 +54,13 @@ async fn run(
         transport,
         api_listeners,
         mut tripwire,
-        lock_registry,
         rx_bcast,
         rx_apply,
         rx_clear_buf,
         rx_changes,
         rx_foca,
+        rx_plumtree,
+        rx_plumtree_updates,
         subs_manager,
         subs_bcast_cache,
         updates_bcast_cache,
@@ -83,36 +87,58 @@ async fn run(
     let (notifications_tx, notifications_rx) =
         bounded(pconf.notifications_channel_len, "notifications");
 
-    let member_states = util::load_member_states(&agent).await;
+    let loaded_member_states = util::load_member_states(&agent).await;
+    let member_states: Vec<_> = loaded_member_states
+        .iter()
+        .map(|(address, member, _)| (*address, member.clone()))
+        .collect();
 
     //// Start the main SWIM runtime loop
-    runtime_loop(
+    let foca_config = runtime_loop(
         // here the agent already has the current cluster_id, we don't need to pass one
         agent.actor(None, agent.config().gossip.member_id),
         agent.clone(),
-        transport.clone(),
         rx_foca,
-        rx_bcast,
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
-        member_states.clone(),
+        member_states,
     );
 
     //// Update member connection RTTs
+    handlers::spawn_rtt_sampler(&transport, tripwire.clone());
     handlers::spawn_rtt_handler(&agent, rtt_rx, tripwire.clone());
 
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
-    util::initialise_foca(&agent, member_states).await;
+    util::initialise_foca(&agent, loaded_member_states).await;
+
+    match agent.broadcast_method() {
+        BroadcastMethod::Gossip => spawn_counted(handle_broadcasts(
+            agent.clone(),
+            rx_bcast,
+            transport.clone(),
+            foca_config,
+            tripwire.clone(),
+            BroadcastOpts::default(),
+        )),
+        BroadcastMethod::Plumtree => spawn_counted(
+            spawn_plumtree_loop(
+                agent.clone(),
+                transport.clone(),
+                rx_plumtree,
+                rx_plumtree_updates,
+                agent.tx_changes().clone(),
+                tripwire.clone(),
+            )
+            .inspect(|_| info!("plumtree loop is done")),
+        ),
+    };
 
     // Load schema from paths
-    let stmts = corro_utils::read_files_from_paths(&agent.config().db.schema_paths).await?;
-    if !stmts.is_empty() {
-        if let Err(e) = execute_schema(&agent, stmts).await {
-            error!("could not execute schema: {e}");
-        }
+    if let Err(e) = execute_schema_from_paths(&agent).await {
+        error!("could not execute schema: {e}");
     }
 
     let mut handles = vec![];
@@ -155,77 +181,34 @@ async fn run(
 
     spawn_handle_db_maintenance(&agent);
 
-    let bookie = Bookie::new_with_registry(Default::default(), lock_registry);
-    {
-        let mut w = bookie.write::<&str, _>("init", None).await;
-        w.insert(agent.actor_id(), agent.booked().clone());
-    }
+    let bookie = agent.bookie().clone();
 
+    // Bookie was fully loaded by setup(). Walk it to schedule apply for any
+    // fully-buffered (gap-free) partials that were never applied before shutdown.
     let start = Instant::now();
     {
-        let conn = agent.pool().read().await?;
-        // check __corro_seq_bookkeeping for any actor ids that we only have partial changes for.
-        let actor_ids: Vec<ActorId> = conn
-            .prepare(
-                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
-                        UNION
-                    SELECT distinct site_id FROM __corro_seq_bookkeeping",
-            )?
-            .query_map([], |row| row.get(0))
-            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
-
-        // not strictly required, but we don't need to keep it open
-        drop(conn);
-
-        let pool = agent.pool();
-
-        let mut buf = futures::stream::iter(
-            actor_ids
-                .into_iter()
-                // don't re-process the current actor!
-                .filter(|other_actor_id| *other_actor_id != agent.actor_id())
-                .map(|actor_id| {
-                    let pool = pool.clone();
-                    async move {
-                        tokio::spawn(async move {
-                            let conn = pool.read().await?;
-
-                            tokio::task::block_in_place(|| {
-                                BookedVersions::from_conn(&conn, actor_id)
-                                    .map(|bv| (actor_id, bv))
-                                    .map_err(eyre::Report::from)
-                            })
-                        })
-                        .await?
-                    }
-                }),
-        )
-        .buffer_unordered(4);
-
-        while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
-            for (version, partial) in bv.partials.iter() {
+        let guard = bookie.owned_guard();
+        for (&actor_id, booked) in bookie.iter(&guard) {
+            let bookedr = booked.read();
+            for (version, partial) in bookedr.partials.iter() {
                 let gaps_count = partial.seqs.gaps(&(CrsqlSeq(0)..=partial.last_seq)).count();
-
                 if gaps_count == 0 {
                     info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
                     let tx_apply = agent.tx_apply().clone();
                     let version = *version;
                     tokio::spawn(async move {
-                        if let Err(e) = tx_apply.send((actor_id, version)).await {
+                        if let Err(e) = tx_apply
+                            .send(ApplyTrigger::Version(actor_id, version))
+                            .await
+                        {
                             error!("could not schedule buffered changes application: {e}");
                         }
                     });
                 }
             }
-
-            bookie
-                .write::<&str, _>("replace_actor", None)
-                .await
-                .replace_actor(actor_id, bv);
         }
     }
-
-    info!("Bookkeeping fully loaded in {:?}", start.elapsed());
+    info!("Checked bookie partials in {:?}", start.elapsed());
 
     spawn_counted(
         util::sync_loop(
@@ -246,6 +229,10 @@ async fn run(
         )
         .inspect(|_| info!("corrosion buffered changes loop is done")),
     );
+
+    if let Err(e) = spawn_reaper(&agent, tripwire.clone()) {
+        error!("could not spawn reaper: {e}");
+    }
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 

@@ -1,10 +1,6 @@
 use crate::agent::RANDOM_NODES_CHOICES;
 use corro_types::{agent::SplitPool, config::DEFAULT_GOSSIP_PORT};
 
-use hickory_resolver::{
-    proto::rr::{RData, RecordType},
-    ResolveErrorKind,
-};
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use std::{collections::HashSet, net::SocketAddr};
 use tokio::task::block_in_place;
@@ -14,9 +10,10 @@ use tracing::{debug, error, warn};
 pub async fn generate_bootstrap(
     bootstrap: &[String],
     our_addr: SocketAddr,
+    allow_mixed_ip: bool,
     pool: &SplitPool,
 ) -> eyre::Result<Vec<SocketAddr>> {
-    let mut addrs = match resolve_bootstrap(bootstrap, our_addr).await {
+    let mut addrs = match resolve_bootstrap(bootstrap, our_addr, allow_mixed_ip).await {
         Ok(addrs) => addrs,
         Err(e) => {
             warn!("could not resolve bootstraps, falling back to in-db nodes: {e}");
@@ -39,8 +36,10 @@ pub async fn generate_bootstrap(
                         (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != *ip => true,
                         (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != *ip => true,
                         _ => {
-                            debug!("ignore node with addr: {addr}");
-                            false
+                            if !allow_mixed_ip {
+                                debug!("ignore node with addr: {addr}");
+                            }
+                            allow_mixed_ip
                         }
                     })
                     .collect(),
@@ -58,9 +57,10 @@ pub async fn generate_bootstrap(
 async fn resolve_bootstrap(
     bootstrap: &[String],
     our_addr: SocketAddr,
+    allow_mixed_ip: bool,
 ) -> eyre::Result<HashSet<SocketAddr>> {
     use hickory_resolver::{
-        config::{NameServerConfigGroup, ResolverConfig},
+        config::{NameServerConfig, ResolverConfig},
         Resolver,
     };
 
@@ -70,87 +70,88 @@ async fn resolve_bootstrap(
         return Ok(addrs);
     }
 
-    let system_resolver = Resolver::builder_tokio()?.build();
+    let system_resolver = match Resolver::builder_tokio()?.build() {
+        Ok(sr) => Some(sr),
+        Err(error) => {
+            error!(%error, "failed to build system DNS resolver");
+            None
+        }
+    };
 
     for s in bootstrap {
         if let Ok(addr) = s.parse() {
             addrs.insert(addr);
-        } else {
-            debug!("attempting to resolve {s}");
-            let mut host_port_dns_server = s.split('@');
-            let mut host_port = host_port_dns_server.next().unwrap().split(':');
-            let mut resolver = None;
-            if let Some(dns_server) = host_port_dns_server.next() {
-                debug!("attempting to use resolver: {dns_server}");
-                let (ip, port) = if let Ok(addr) = dns_server.parse::<SocketAddr>() {
-                    (addr.ip(), addr.port())
-                } else {
-                    (dns_server.parse()?, 53)
-                };
-                resolver = Some(
-                    Resolver::builder_with_config(
-                        ResolverConfig::from_parts(
-                            None,
-                            vec![],
-                            NameServerConfigGroup::from_ips_clear(&[ip], port, true),
-                        ),
-                        hickory_resolver::name_server::TokioConnectionProvider::default(),
-                    )
-                    .build(),
-                );
-                debug!("using resolver: {dns_server}");
+            continue;
+        }
+
+        debug!("attempting to resolve {s}");
+        let mut host_port_dns_server = s.split('@');
+        let mut host_port = host_port_dns_server.next().unwrap().split(':');
+        let mut resolver = None;
+        if let Some(dns_server) = host_port_dns_server.next() {
+            debug!("attempting to use resolver: {dns_server}");
+            let (ip, port) = if let Ok(addr) = dns_server.parse::<SocketAddr>() {
+                (addr.ip(), addr.port())
+            } else {
+                (dns_server.parse()?, 53)
+            };
+
+            // ConnectionConfig is non_exhaustive, hence this ugly constructions
+            let mut nsc = NameServerConfig::udp_and_tcp(ip);
+            for cc in &mut nsc.connections {
+                cc.port = port;
             }
-            if let Some(hostname) = host_port.next() {
-                debug!("Resolving '{hostname}' to an IP");
-                match resolver
-                    .as_ref()
-                    .unwrap_or(&system_resolver)
-                    .lookup(
-                        hostname,
-                        if our_addr.is_ipv6() {
-                            RecordType::AAAA
-                        } else {
-                            RecordType::A
-                        },
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        debug!("Successfully resolved things: {response:?}");
-                        let port: u16 = host_port
-                            .next()
-                            .and_then(|p| p.parse().ok())
-                            .unwrap_or(DEFAULT_GOSSIP_PORT);
-                        for addr in response.iter().filter_map(|rdata| match rdata {
-                            RData::A(ip) => Some(SocketAddr::from((ip.0, port))),
-                            RData::AAAA(ip) => Some(SocketAddr::from((ip.0, port))),
-                            _ => None,
-                        }) {
-                            match (our_addr, addr) {
-                                (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != ip => {}
-                                (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != ip => {}
-                                _ => {
-                                    debug!("ignore node with addr: {addr}");
-                                    continue;
-                                }
+
+            match Resolver::builder_with_config(
+                ResolverConfig::from_parts(None, Vec::new(), vec![nsc]),
+                hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+            )
+            .build()
+            {
+                Ok(res) => {
+                    debug!("using resolver: {dns_server}");
+                    resolver = Some(res);
+                }
+                Err(error) => {
+                    error!(%error, "failed to build DNS resolver");
+                }
+            }
+        }
+
+        let Some(hostname) = host_port.next() else {
+            continue;
+        };
+
+        let Some(resolver) = resolver.as_ref().or(system_resolver.as_ref()) else {
+            eyre::bail!("could not resolve '{hostname}', no resolvers available");
+        };
+
+        debug!("Resolving '{hostname}' to an IP");
+        match resolver.lookup_ip(hostname).await {
+            Ok(response) => {
+                debug!("Successfully resolved things: {response:?}");
+                let port: u16 = host_port
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(DEFAULT_GOSSIP_PORT);
+                for addr in response.iter().map(|ip| SocketAddr::from((ip, port))) {
+                    match (our_addr, addr) {
+                        (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != ip => {}
+                        (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != ip => {}
+                        _ => {
+                            debug!("ignore node with addr: {addr}");
+                            if !allow_mixed_ip {
+                                continue;
                             }
-                            addrs.insert(addr);
                         }
                     }
-                    Err(e) => match e.kind() {
-                        ResolveErrorKind::Proto(e) => {
-                            if matches!(
-                                e.kind(),
-                                hickory_resolver::proto::ProtoErrorKind::NoRecordsFound { .. }
-                            ) {
-                                // do nothing, that might be fine!
-                            }
-                        }
-                        _ => {
-                            error!("could not resolve '{hostname}': {e}");
-                            return Err(e.into());
-                        }
-                    },
+                    addrs.insert(addr);
+                }
+            }
+            Err(e) => {
+                if !e.is_no_records_found() {
+                    error!("could not resolve '{hostname}': {e}");
+                    return Err(e.into());
                 }
             }
         }

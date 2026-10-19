@@ -1,8 +1,16 @@
 use std::{
-    cmp, collections::HashMap, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref,
+    cmp,
+    collections::HashMap,
+    fmt, io,
+    net::SocketAddr,
+    num::{NonZeroU32, ParseIntError},
+    ops::Deref,
     time::Duration,
 };
 
+use crate::compress::{
+    decompress_change, try_compress_change_for_wire, CompressError, WireCompression, ZstdDicts,
+};
 use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
 use corro_api_types::{ColumnName, SqliteValue, TableName};
@@ -10,6 +18,7 @@ use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use indexmap::{map::Entry, IndexMap};
 use metrics::counter;
+use plum_foca::Payload;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -17,10 +26,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Reader, Writable, Writer};
 use time::OffsetDateTime;
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::block_in_place,
-};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, trace};
 use uhlc::NTP64;
 
@@ -31,7 +37,6 @@ use crate::{
     change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
     pubsub::MatchableChange,
-    sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
     updates::match_changes,
 };
@@ -48,6 +53,61 @@ pub enum UniPayload {
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
+    Plumtree(PlumtreeWire),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Readable, Writable)]
+pub struct ChangeId {
+    pub actor_id: ActorId,
+    pub changeset_id: ChangesetId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Readable, Writable)]
+pub enum ChangesetId {
+    Full {
+        version: CrsqlDbVersion,
+        seqs: CrsqlSeqRange,
+        last_seq: CrsqlSeq,
+    },
+    Empty {
+        versions: CrsqlDbVersionRange,
+    },
+}
+
+/// Plumtree gossip payload. Carries a stable message id for the protocol and
+/// the original wire form (possibly compressed)
+#[derive(Debug, Clone, Readable, Writable)]
+pub struct PlumtreePayload {
+    pub id: ChangeId,
+    pub bcast: BroadcastV1,
+}
+
+impl Payload for PlumtreePayload {
+    type MessageId = ChangeId;
+    type NodeId = ActorId;
+
+    fn message_id(&self) -> ChangeId {
+        self.id.clone()
+    }
+
+    fn origin(&self) -> Self::NodeId {
+        self.id.actor_id
+    }
+}
+
+impl plum_foca::MessageId for ChangeId {
+    type NodeId = ActorId;
+    fn origin(&self) -> ActorId {
+        self.actor_id
+    }
+}
+
+/// Concrete Plumtree message type used on the wire.
+pub type PlumtreeMsgV1 = plum_foca::PlumtreeMsg<ChangeId, PlumtreePayload, ActorId>;
+
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum PlumtreeWire {
+    V1 { data: PlumtreeMsgV1 },
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -56,6 +116,9 @@ pub enum BiPayload {
         data: BiPayloadV1,
         #[speedy(default_on_eof)]
         cluster_id: ClusterId,
+        /// Whether the sender can decode compressed sync/broadcast changesets.
+        #[speedy(default_on_eof)]
+        supports_compression: bool,
     },
 }
 
@@ -89,9 +152,95 @@ pub enum AuthzV1 {
     Token(String),
 }
 
+#[derive(Debug)]
+pub enum PlumtreeInput {
+    /// A wire message received from a remote peer (deserialized from uni-stream).
+    Wire(PlumtreeMsgV1),
+    /// Application wants to originate a new broadcast.
+    Broadcast(ChangeV1),
+    /// Diagnostics: request a snapshot of the current plumtree state.
+    QueryStats(oneshot::Sender<PlumtreeStats>),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlumtreeStats {
+    /// Peers we push GOSSIP to directly (the spanning-tree branches).
+    pub eager_peers: Vec<ActorId>,
+    /// Peers we only send IHAVE digests to.
+    pub lazy_peers: Vec<ActorId>,
+    /// Peers pinned to eager because of their ring/latency.
+    pub ring_locked_peers: Vec<ActorId>,
+    /// Total number of peers known to the overlay.
+    pub known_peers: usize,
+    /// Target number of eager peers (fanout).
+    pub num_eager_target: usize,
+    /// Target minimum number of lazy peers.
+    pub min_lazy_target: usize,
+    /// Target maximum number of lazy peers.
+    pub max_lazy_target: usize,
+    /// Number of pending IHAVE digests queued for lazy peers.
+    pub lazy_queue_len: usize,
+    /// Number of message ids currently tracked in the seen cache.
+    pub seen_cache_size: usize,
+    /// Number of cached payloads available to answer GRAFTs.
+    pub payload_cache_size: usize,
+}
+
+#[derive(Debug)]
+pub enum PlumtreeUpdates {
+    MemberUp {
+        actor_id: ActorId,
+        addr: SocketAddr,
+        ring: Option<u8>,
+        // rtt_ms: u64,
+    },
+    MemberDown(ActorId),
+}
+
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
+    // zstd-compressed, speedy-encoded ChangeV1
+    CompressedChange(Vec<u8>),
+}
+
+impl BroadcastV1 {
+    pub fn is_compressed(&self) -> bool {
+        matches!(self, BroadcastV1::CompressedChange(_))
+    }
+
+    /// Try to compress the inner `ChangeV1` for the wire. Falls back to the
+    /// original, uncompressed variant if compression fails or doesn't
+    /// actually shrink the payload.
+    pub fn compress_for_wire(self, level: i32, dicts: Option<&ZstdDicts>) -> Self {
+        let BroadcastV1::Change(change) = self else {
+            return self;
+        };
+
+        match try_compress_change_for_wire(&change, "broadcast", level, dicts) {
+            Ok(WireCompression::Compressed(compressed)) => {
+                BroadcastV1::CompressedChange(compressed)
+            }
+            Ok(WireCompression::Uncompressed) => BroadcastV1::Change(change),
+            Err(e) => {
+                counter!("corro.compression.errors.total", "traffic" => "broadcast").increment(1);
+                debug!("could not compress broadcast change, sending uncompressed: {e}");
+                BroadcastV1::Change(change)
+            }
+        }
+    }
+
+    /// Decode the inner `ChangeV1`, borrowing `self` so the original wire
+    /// form (compressed or not) can still be reused verbatim -- e.g. to
+    /// rebroadcast it to other peers without re-deciding/re-compressing.
+    pub fn into_change(&self, dicts: Option<&ZstdDicts>) -> Result<ChangeV1, BroadcastDecodeError> {
+        match self {
+            BroadcastV1::Change(change) => Ok(change.clone()),
+            BroadcastV1::CompressedChange(data) => {
+                decompress_change(data, "broadcast", dicts).map_err(Into::into)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -110,10 +259,87 @@ pub enum ChangeSource {
     Sync,
 }
 
-#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     pub changeset: Changeset,
+}
+
+#[derive(Readable)]
+struct UnvalidatedChangeV1 {
+    actor_id: ActorId,
+    changeset: Changeset,
+}
+
+impl<'a, C> Readable<'a, C> for ChangeV1
+where
+    C: Context,
+{
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        let change = UnvalidatedChangeV1::read_from(reader)?;
+        let change = Self {
+            actor_id: change.actor_id,
+            changeset: change.changeset,
+        };
+
+        change
+            .validate()
+            .map_err(|error| speedy::Error::custom(error.to_string()))?;
+
+        Ok(change)
+    }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        <UnvalidatedChangeV1 as Readable<'a, C>>::minimum_bytes_needed()
+    }
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum ChangeValidationError {
+    #[error("invalid changeset version range: start {start} is greater than end {end}")]
+    InvertedVersions {
+        start: CrsqlDbVersion,
+        end: CrsqlDbVersion,
+    },
+    #[error("invalid changeset sequence range: start {start} is greater than end {end}")]
+    InvertedSeqs { start: CrsqlSeq, end: CrsqlSeq },
+}
+
+impl ChangeV1 {
+    pub fn validate(&self) -> Result<(), ChangeValidationError> {
+        match &self.changeset {
+            Changeset::Empty { versions, .. } => validate_versions(*versions)?,
+            Changeset::EmptySet { versions, .. } => {
+                for versions in versions {
+                    validate_versions(*versions)?;
+                }
+            }
+            Changeset::Full { .. } | Changeset::FullV2 { .. } => {}
+        }
+
+        if let Some(seqs) = self.seqs() {
+            if seqs.start() > seqs.end() {
+                return Err(ChangeValidationError::InvertedSeqs {
+                    start: seqs.start(),
+                    end: seqs.end(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_versions(versions: CrsqlDbVersionRange) -> Result<(), ChangeValidationError> {
+    if versions.start() > versions.end() {
+        return Err(ChangeValidationError::InvertedVersions {
+            start: versions.start(),
+            end: versions.end(),
+        });
+    }
+
+    Ok(())
 }
 
 impl Deref for ChangeV1 {
@@ -121,6 +347,22 @@ impl Deref for ChangeV1 {
 
     fn deref(&self) -> &Self::Target {
         &self.changeset
+    }
+}
+
+impl Payload for ChangeV1 {
+    type MessageId = ChangeId;
+    type NodeId = ActorId;
+
+    fn message_id(&self) -> ChangeId {
+        ChangeId {
+            actor_id: self.actor_id,
+            changeset_id: self.changeset.id(),
+        }
+    }
+
+    fn origin(&self) -> Self::NodeId {
+        self.actor_id
     }
 }
 
@@ -262,7 +504,7 @@ impl Changeset {
             Changeset::Empty { versions, .. } => *versions,
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => CrsqlDbVersionRange::empty(),
+            Changeset::EmptySet { .. } => CrsqlDbVersionRange::single(CrsqlDbVersion(0)),
             Changeset::Full { version, .. } => CrsqlDbVersionRange::single(*version),
             Changeset::FullV2 { version, .. } => CrsqlDbVersionRange::single(*version),
         }
@@ -432,6 +674,37 @@ impl Changeset {
             Changeset::Empty { .. } | Changeset::EmptySet { .. } => Box::new(std::iter::empty()),
         }
     }
+
+    pub fn id(&self) -> ChangesetId {
+        match self {
+            Changeset::Full {
+                version,
+                seqs,
+                last_seq,
+                ..
+            } => ChangesetId::Full {
+                version: *version,
+                seqs: *seqs,
+                last_seq: *last_seq,
+            },
+            Changeset::FullV2 {
+                version,
+                seqs,
+                last_seq,
+                ..
+            } => ChangesetId::Full {
+                version: *version,
+                seqs: *seqs,
+                last_seq: *last_seq,
+            },
+            Changeset::Empty { versions, .. } => ChangesetId::Empty {
+                versions: *versions,
+            },
+            Changeset::EmptySet { .. } => {
+                todo!()
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -440,8 +713,7 @@ pub enum TimestampParseError {
     Parse(ParseIntError),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
-#[serde(transparent)]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialOrd, Ord)]
 pub struct Timestamp(pub NTP64);
 
 impl Timestamp {
@@ -460,6 +732,24 @@ impl Timestamp {
 
     pub fn is_zero(&self) -> bool {
         self.0 .0 == 0
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.0 .0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self(NTP64(u64::deserialize(deserializer)?)))
     }
 }
 
@@ -580,6 +870,8 @@ pub enum BroadcastDecodeError {
     Io(#[from] io::Error),
     #[error("insufficient length received to decode message: {0}")]
     InsufficientLength(usize),
+    #[error(transparent)]
+    Compress(#[from] CompressError),
 }
 
 #[derive(Debug)]
@@ -651,82 +943,192 @@ impl<T> DispatchRuntime<T> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum BroadcastError {
-    #[error(transparent)]
-    Pool(#[from] SqlitePoolError),
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-}
-
-pub async fn broadcast_changes(
-    agent: Agent,
+/// Dispatch a committed local version before releasing its write permit.
+///
+/// Use the writer connection so extraction cannot wait on the shared read pool.
+/// The caller must retain write ownership and run on a blocking thread until
+/// extraction finishes, before a later write can replace current-clock rows.
+pub fn broadcast_changes(
+    agent: &Agent,
+    conn: &rusqlite::Connection,
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
     ts: Timestamp,
-) -> Result<(), BroadcastError> {
+) -> rusqlite::Result<()> {
     let actor_id = agent.actor_id();
-    let conn = agent.pool().read().await?;
-    trace!("got conn for broadcast");
-
-    block_in_place(|| {
-        // TODO: make this more generic so both sync and local changes can use it.
-        let mut prepped = conn.prepare_cached(
-            r#"
-                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                    FROM crsql_changes
-                    WHERE db_version = ?
-                    AND site_id = crsql_site_id()
-                    ORDER BY seq ASC
-            "#,
-        )?;
-        let rows = prepped.query_map([db_version], row_to_change)?;
-        let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
-        for changes_seqs in chunked {
-            match changes_seqs {
-                Ok((changes, seqs)) => {
-                    for (table_name, count) in changes.count() {
-                        counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
-                    }
-
-                    trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
-
-                    debug!("match_changes db_version: {db_version}");
-                    let changeset = Changeset::FullV2 {
-                        actor_id,
-                        version: db_version,
-                        changes,
-                        seqs,
-                        last_seq,
-                        ts,
-                    };
-                    match_changes(agent.subs_manager(), &changeset, db_version);
-                    match_changes(agent.updates_manager(), &changeset, db_version);
-
-                    let tx_bcast = agent.tx_bcast().clone();
-                    assert_sometimes!(true, "Corrosion broadcasts changes");
-                    tokio::spawn(async move {
-                        if let Err(e) = tx_bcast
-                            .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                ChangeV1 {
-                                    actor_id,
-                                    changeset,
-                                },
-                            )))
-                            .await
-                        {
-                            error!("could not send change message for broadcast: {e}");
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                    break;
-                }
-            }
+    let mut prepped = conn.prepare_cached(
+        r#"
+            SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                FROM main.crsql_changes
+                WHERE db_version = ?
+                AND site_id = crsql_site_id()
+                ORDER BY seq ASC
+        "#,
+    )?;
+    let rows = prepped.query_map([db_version], row_to_change)?;
+    let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+    for changes_seqs in chunked {
+        let (changes, seqs) = changes_seqs?;
+        for (table_name, count) in changes.count() {
+            counter!("corro.changes.committed", "table" => table_name, "source" => "local")
+                .increment(count as u64);
         }
-        Ok::<_, rusqlite::Error>(())
-    })?;
 
+        trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+        debug!("match_changes db_version: {db_version}");
+        let changeset = Changeset::FullV2 {
+            actor_id,
+            version: db_version,
+            changes,
+            seqs,
+            last_seq,
+            ts,
+        };
+        match_changes(agent.subs_manager(), &changeset, db_version);
+        match_changes(agent.updates_manager(), &changeset, db_version);
+
+        assert_sometimes!(true, "Corrosion broadcasts changes");
+        agent.broadcaster().broadcast_local(ChangeV1 {
+            actor_id,
+            changeset,
+        });
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn change_with_rows(n: usize) -> ChangeV1 {
+        let actor_id = ActorId(Uuid::new_v4());
+        let changes = (0..n)
+            .map(|i| Change {
+                table: "test_table".into(),
+                pk: format!("pk-{i}").into_bytes(),
+                cid: "some_column".into(),
+                val: SqliteValue::Text("a fairly repetitive value".into()),
+                col_version: 1,
+                db_version: CrsqlDbVersion(1),
+                seq: CrsqlSeq(i as u64),
+                site_id: actor_id.to_bytes(),
+                cl: 1,
+            })
+            .collect::<Vec<_>>();
+
+        ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: CrsqlDbVersion(1),
+                changes,
+                seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(n.max(1) as u64 - 1)),
+                last_seq: CrsqlSeq(n.max(1) as u64 - 1),
+                ts: Timestamp::zero(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_compress_change_compresses_and_roundtrips() {
+        let change = change_with_rows(100);
+        let raw_len = change.write_to_vec().unwrap().len();
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, None);
+
+        let BroadcastV1::CompressedChange(compressed) = bcast else {
+            panic!("expected a large, repetitive change to compress");
+        };
+        let compressed_len = compressed.len();
+
+        assert!(
+            compressed_len < raw_len,
+            "compressed size ({compressed_len}) should be smaller than raw ({raw_len})"
+        );
+
+        let ratio = (1.0 - compressed_len as f64 / raw_len as f64) * 100.0;
+        eprintln!(
+            "broadcast change compression: raw={raw_len}B compressed={compressed_len}B ratio={ratio:.1}%"
+        );
+
+        let decoded = BroadcastV1::CompressedChange(compressed)
+            .into_change(None)
+            .unwrap();
+        assert_eq!(decoded, change);
+    }
+
+    fn trained_dict_bytes() -> Vec<u8> {
+        let samples: Vec<Vec<u8>> = (1..200)
+            .map(|n| change_with_rows(n).write_to_vec().unwrap())
+            .collect();
+        zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
+    }
+
+    #[test]
+    fn test_compress_change_with_dict_roundtrips() {
+        let change = change_with_rows(50);
+        let dicts = ZstdDicts::new(Some(&trained_dict_bytes()), 3, vec![]);
+
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&dicts));
+        let BroadcastV1::CompressedChange(compressed) = bcast else {
+            panic!("expected change to compress with a dict");
+        };
+
+        let decoded = BroadcastV1::CompressedChange(compressed)
+            .into_change(Some(&dicts))
+            .unwrap();
+        assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn test_decode_with_older_dict_via_directory_scan() {
+        // Simulate a rotation: encode with the "old" dict, but the decoder
+        // was configured with a "new" primary dict and only knows the old
+        // one via its extra (directory-scanned) dictionaries.
+        let old_dict_bytes = trained_dict_bytes();
+        let new_dict_bytes = {
+            let samples: Vec<Vec<u8>> = (200..400)
+                .map(|n| change_with_rows(n).write_to_vec().unwrap())
+                .collect();
+            zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
+        };
+
+        let encoder_dicts = ZstdDicts::new(Some(&old_dict_bytes), 3, vec![]);
+        let decoder_dicts = ZstdDicts::new(Some(&new_dict_bytes), 3, vec![old_dict_bytes]);
+
+        let change = change_with_rows(50);
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
+        let BroadcastV1::CompressedChange(compressed) = bcast else {
+            panic!("expected change to compress with a dict");
+        };
+
+        let decoded = BroadcastV1::CompressedChange(compressed)
+            .into_change(Some(&decoder_dicts))
+            .unwrap();
+        assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn test_decode_fails_for_unknown_dict_id() {
+        let old_dict_bytes = trained_dict_bytes();
+        let encoder_dicts = ZstdDicts::new(Some(&old_dict_bytes), 3, vec![]);
+        // decoder doesn't know about `old_dict_bytes` at all
+        let new_dict_bytes = {
+            let samples: Vec<Vec<u8>> = (200..400)
+                .map(|n| change_with_rows(n).write_to_vec().unwrap())
+                .collect();
+            zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
+        };
+        let decoder_dicts = ZstdDicts::new(Some(&new_dict_bytes), 3, vec![]);
+
+        let change = change_with_rows(50);
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
+        let BroadcastV1::CompressedChange(compressed) = bcast else {
+            panic!("expected change to compress with a dict");
+        };
+
+        let err = BroadcastV1::CompressedChange(compressed)
+            .into_change(Some(&decoder_dicts))
+            .unwrap_err();
+        assert!(matches!(err, BroadcastDecodeError::Compress(_)));
+    }
 }

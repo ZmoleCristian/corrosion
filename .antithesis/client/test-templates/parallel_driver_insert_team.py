@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
+from antithesis.random import AntithesisRandom
 import argparse
-import random
 import time
 import threading
 
@@ -10,7 +10,7 @@ sys.path.append("/opt/antithesis/py-resources")
 import helper
 
 
-random = random.SystemRandom()
+random = AntithesisRandom()
 
 def insert_team(address):
     try:
@@ -38,7 +38,7 @@ def insert_team(address):
 
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')
-    parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addresses corrosion1:8080 corrosion2:8080)')
+    parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addrs corrosion1:8080 corrosion2:8080)')
     args = parser.parse_args()
     if args.addrs is None:
         args.addrs = ["corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]

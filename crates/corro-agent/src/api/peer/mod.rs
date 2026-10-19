@@ -12,11 +12,12 @@ use corro_types::base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqR
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
-use corro_types::change::{row_to_change, Change, ChunkedChanges};
+use corro_types::change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE};
 use corro_types::config::GossipConfig;
 use corro_types::sync::{
-    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
-    SyncRequestV1, SyncStateV1, SyncTraceContextV1,
+    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1,
+    SyncNeedValidationError, SyncRejectionV1, SyncRequestV1, SyncStateV1, SyncStateValidationError,
+    SyncTraceContextV1,
 };
 use eyre::{ContextCompat, WrapErr};
 use futures::stream::FuturesUnordered;
@@ -44,6 +45,7 @@ use crate::agent::SyncRecvError;
 use crate::transport::{Transport, TransportError};
 
 use corro_types::{actor::ActorId, agent::Bookie};
+use sqlite_pool::InterruptibleTransaction;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -57,6 +59,8 @@ pub enum SyncError {
     Rejection(#[from] SyncRejectionV1),
     #[error(transparent)]
     Transport(#[from] TransportError),
+    #[error(transparent)]
+    InvalidState(#[from] SyncStateValidationError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -303,10 +307,13 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
     Ok(client_config)
 }
 
-pub async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
+pub async fn gossip_client_endpoint(
+    config: &GossipConfig,
+    bind_addr: SocketAddr,
+) -> eyre::Result<quinn::Endpoint> {
     let client_config = build_quinn_client_config(config).await?;
 
-    let mut client = quinn::Endpoint::client(config.client_addr)?;
+    let mut client = quinn::Endpoint::client(bind_addr)?;
 
     client.set_default_client_config(client_config);
     Ok(client)
@@ -368,7 +375,6 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 8 * 1024;
 const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 1024;
 
 const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
@@ -380,6 +386,7 @@ fn handle_need(
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
+    need.validate()?;
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
     let mut empties: RangeInclusiveSet<CrsqlDbVersion> = RangeInclusiveSet::new();
@@ -387,6 +394,8 @@ fn handle_need(
     assert_sometimes!(true, "Corrosion handles sync requests from other nodes");
     // this is a read transaction!
     let tx = conn.transaction()?;
+    let timeout = Some(Duration::from_secs(60));
+    let tx = InterruptibleTransaction::new(tx, timeout, "handle_need");
 
     let mut prepped = tx.prepare_cached(
         "
@@ -448,7 +457,7 @@ fn handle_need(
 
                 send_change_chunks(
                     sender,
-                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE),
                     actor_id,
                     version,
                     last_seq,
@@ -527,12 +536,7 @@ fn handle_need(
 
                         send_change_chunks(
                             sender,
-                            ChunkedChanges::new(
-                                rows,
-                                start_seq,
-                                end_seq,
-                                MAX_CHANGES_BYTES_PER_MESSAGE,
-                            ),
+                            ChunkedChanges::new(rows, start_seq, end_seq, MAX_CHANGES_BYTE_SIZE),
                             actor_id,
                             version,
                             last_seq,
@@ -586,7 +590,7 @@ fn handle_need(
                                 rows,
                                 range_needed.start(),
                                 range_needed.end(),
-                                MAX_CHANGES_BYTES_PER_MESSAGE,
+                                MAX_CHANGES_BYTE_SIZE,
                             ),
                             actor_id,
                             version,
@@ -708,7 +712,7 @@ fn handle_need(
                                         rows,
                                         start_seq,
                                         end_seq,
-                                        MAX_CHANGES_BYTES_PER_MESSAGE,
+                                        MAX_CHANGES_BYTE_SIZE,
                                     ),
                                     actor_id,
                                     version,
@@ -805,6 +809,15 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     Ok(())
 }
 
+fn validate_sync_needs(
+    requests: &[(ActorId, Vec<SyncNeedV1>)],
+) -> Result<(), SyncNeedValidationError> {
+    requests
+        .iter()
+        .flat_map(|(_, needs)| needs)
+        .try_for_each(SyncNeedV1::validate)
+}
+
 async fn process_sync(
     pool: SplitPool,
     bookie: Bookie,
@@ -854,19 +867,15 @@ async fn process_sync(
                     .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
                     .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
 
+                validate_sync_needs(&agg)?;
+
                 for (actor_id, needs) in agg {
-                    let booked = bookie
-                        .read::<&str, _>("process_sync get actor", None)
-                        .await
-                        .get(&actor_id)
-                        .cloned();
+                    let booked = bookie.get(&actor_id);
                     let booked = match booked {
                         Some(b) => b,
                         None => continue,
                     };
-                    let booked_read = booked
-                        .read::<&str, _>("process_sync check needs", None)
-                        .await;
+                    let booked_read = booked.read();
 
                     for need in needs {
                         match &need {
@@ -981,6 +990,7 @@ async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<()
     let len = send_buf.len();
     write.write_chunk(send_buf.split().freeze()).await?;
     counter!("corro.sync.chunk.sent.bytes").increment(len as u64);
+    counter!("corro.transport.tx.bytes.v2.total", "traffic" => "sync").increment(len as u64);
 
     Ok(())
 }
@@ -1046,7 +1056,14 @@ pub async fn parallel_sync(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}, cluster_id: agent.cluster_id()},
+                        BiPayload::V1 {
+                            data: BiPayloadV1::SyncStart {
+                                actor_id: agent.actor_id(),
+                                trace_ctx,
+                            },
+                            cluster_id: agent.cluster_id(),
+                            supports_compression: agent.config().gossip.compression_config().enabled,
+                        },
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
                     .await?;
@@ -1091,9 +1108,9 @@ pub async fn parallel_sync(
                     }
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
 
-                    counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
+                    counter!("corro.sync.client.member", "traffic" => "sync").increment(1);
 
-                    let needs = our_sync_state.compute_available_needs(&their_sync_state);
+                    let needs = our_sync_state.compute_available_needs(&their_sync_state)?;
 
                     debug!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs: {:?}, their_sync_state: {:?}", needs, their_sync_state);
 
@@ -1120,9 +1137,8 @@ pub async fn parallel_sync(
             Err(e) => {
                 counter!(
                     "corro.sync.client.handshake.errors",
-                    "actor_id" => actor_id.to_string(),
-                    "addr" => addr.to_string(),
-                    "error" => e.to_string()
+                    "traffic" => "sync",
+                    "kind" => "handshake"
                 )
                 .increment(1);
                 match agg {
@@ -1297,7 +1313,8 @@ pub async fn parallel_sync(
                         continue 'servers;
                     }
 
-                    counter!("corro.sync.client.req.sent", "actor_id" => server_actor_id.to_string()).increment(req_len as u64);
+                    counter!("corro.sync.client.req.sent", "traffic" => "sync")
+                        .increment(req_len as u64);
                 }
 
                 if !send_buf.is_empty() {
@@ -1347,14 +1364,16 @@ pub async fn parallel_sync(
                             let changes_len = cmp::max(change.len(), 1);
                             // tracing::Span::current().record("changes_len", changes_len);
                             count += changes_len;
-                            counter!("corro.sync.changes.recv", "actor_id" => actor_id.to_string())
+                            counter!("corro.sync.changes.recv", "traffic" => "sync")
                                 .increment(changes_len as u64);
 
                             debug!(
-                                "handling versions: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}) from {actor_id}",
+                               "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
                                 change.versions(),
+                                change.actor_id,
                                 change.seqs(),
-                                change.is_empty()
+                                change.is_empty(),
+                                change.is_complete()
                             );
                             // only accept emptyset that's from the same node that's syncing
                             if change.is_empty_set() {
@@ -1363,7 +1382,7 @@ pub async fn parallel_sync(
                             }
 
                             tx_changes
-                                .send((change, ChangeSource::Sync))
+                                .send((change, ChangeSource::Sync, None))
                                 .await
                                 .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
                         }
@@ -1382,6 +1401,10 @@ pub async fn parallel_sync(
                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
                             return Err(rejection.into())
                         }
+                        SyncMessage::V1(SyncMessageV1::CompressedChangeset(_)) => {
+                            warn!(%actor_id, "received sync compressed change unexpectedly, ignoring");
+                            continue
+                        },
                     },
                 }
             }
@@ -1413,15 +1436,22 @@ pub async fn parallel_sync(
 }
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_sync(
     agent: &Agent,
     bookie: &Bookie,
     their_actor_id: ActorId,
     trace_ctx: SyncTraceContextV1,
+    wants_compression: bool,
     cluster_id: ClusterId,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
+    // only compress if the peer can decode it AND we're locally configured to
+    let compression_config = agent.config().gossip.compression_config();
+    let supports_compression = wants_compression && compression_config.enabled;
+    let compression_level = compression_config.level;
+
     let context =
         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&trace_ctx));
     tracing::Span::current().set_parent(context);
@@ -1434,6 +1464,13 @@ pub async fn serve_sync(
     let mut encode_buf = BytesMut::new();
 
     if cluster_id != agent.cluster_id() {
+        error!(
+            "got a different cluster_id ({:?}): {} vs {} - {}",
+            their_actor_id,
+            cluster_id,
+            agent.cluster_id(),
+            wants_compression
+        );
         encode_write_sync_msg(
             &mut codec,
             &mut encode_buf,
@@ -1566,6 +1603,21 @@ pub async fn serve_sync(
                             if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
                                 count += change.len();
                             }
+                            let msg = if supports_compression {
+                                match tokio::task::spawn_blocking(move || {
+                                    msg.compress_changeset(compression_level)
+                                })
+                                .await
+                                {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        error!("compress_changeset task panicked: {e}");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                msg
+                            };
                             encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
 
                             if send_buf.len() >= 16 * 1024 {
@@ -1599,7 +1651,7 @@ pub async fn serve_sync(
 
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
-            counter!("corro.sync.changes.sent", "actor_id" => their_actor_id.to_string()).increment(count as u64);
+            counter!("corro.sync.changes.sent", "traffic" => "sync").increment(count as u64);
 
             Ok::<_, SyncError>(count)
         }.instrument(info_span!("process_versions_to_send")),
@@ -1644,13 +1696,17 @@ pub async fn serve_sync(
                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
                             return Err(rejection.into())
                         }
+                        SyncMessage::V1(SyncMessageV1::CompressedChangeset(_)) => {
+                            warn!(actor_id = %their_actor_id, "received sync compressed change unexpectedly, ignoring");
+                            continue
+                        },
                     },
                 }
             }
 
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
-            counter!("corro.sync.requests.recv", "actor_id" => their_actor_id.to_string()).increment(count as u64);
+            counter!("corro.sync.requests.recv", "traffic" => "sync").increment(count as u64);
 
             Ok(count)
         }.instrument(info_span!("process_version_requests"))
@@ -1666,7 +1722,7 @@ pub async fn serve_sync(
 #[cfg(test)]
 mod tests {
     use crate::api::public::api_v1_transactions;
-    use axum::{Extension, Json};
+    use axum::Extension;
     use camino::Utf8PathBuf;
     use corro_tests::launch_test_agent;
     use corro_tests::TEST_SCHEMA;
@@ -1675,7 +1731,10 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
-        config::{Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
+        config::{
+            BroadcastConfig, CompressionConfig, Config, TlsClientConfig, TlsConfig,
+            DEFAULT_GOSSIP_CLIENT_ADDR,
+        },
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -1685,11 +1744,41 @@ mod tests {
     use tripwire::Tripwire;
 
     use crate::{
-        agent::{process_multiple_changes, setup},
-        api::public::{api_v1_db_schema, TimeoutParams},
+        agent::{process_multiple_changes, setup, util::execute_schema},
+        api::public::TimeoutParams,
     };
 
     use super::*;
+
+    #[test]
+    fn range_validation_checks_all_direct_needs_before_processing() {
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let other_actor_id = ActorId(uuid::Uuid::new_v4());
+        let requests = vec![
+            (
+                actor_id,
+                vec![SyncNeedV1::Full {
+                    versions: dbvr!(5, 5),
+                }],
+            ),
+            (
+                other_actor_id,
+                vec![SyncNeedV1::Full {
+                    versions: dbvr!(10, 5),
+                }],
+            ),
+        ];
+
+        assert_eq!(
+            validate_sync_needs(&requests),
+            Err(SyncNeedValidationError::InvertedFull {
+                start: CrsqlDbVersion(10),
+                end: CrsqlDbVersion(5),
+            })
+        );
+
+        assert!(validate_sync_needs(&requests[..1]).is_ok());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_sync_changes_order() -> eyre::Result<()> {
@@ -1764,10 +1853,7 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let actor_id = ActorId(uuid::Uuid::new_v4());
 
@@ -1837,15 +1923,10 @@ mod tests {
         )
         .await?;
 
-        let booked = bookie
-            .read::<&str, _>("test", None)
-            .await
-            .get(&actor_id)
-            .cloned()
-            .unwrap();
+        let booked = bookie.get(&actor_id).unwrap();
 
         {
-            let read = booked.read::<&str, _>("test", None).await;
+            let read = booked.read();
 
             assert!(read.contains_version(&CrsqlDbVersion(1)));
             assert!(read.contains_version(&CrsqlDbVersion(2)));
@@ -2411,9 +2492,12 @@ mod tests {
 
         let gossip_config = GossipConfig {
             bind_addr: "127.0.0.1:0".parse()?,
-            client_addr: DEFAULT_GOSSIP_CLIENT_ADDR,
+            client_addr: None,
+            client_addr_v4: None,
+            client_addr_v6: None,
             external_addr: None,
             bootstrap: vec![],
+            allow_mixed_ip: false,
             tls: Some(TlsConfig {
                 cert_file,
                 key_file,
@@ -2429,12 +2513,19 @@ mod tests {
             max_mtu: None,
             disable_gso: false,
             member_id: None,
+            compression: Some(CompressionConfig {
+                enabled: false,
+                level: 3,
+                dict_dir: None,
+                dict_file: None,
+            }),
+            broadcast: BroadcastConfig::Gossip,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;
         let addr = server.local_addr()?;
 
-        let client = gossip_client_endpoint(&gossip_config).await?;
+        let client = gossip_client_endpoint(&gossip_config, DEFAULT_GOSSIP_CLIENT_ADDR).await?;
 
         let res = tokio::try_join!(
             async {

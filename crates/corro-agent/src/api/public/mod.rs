@@ -7,14 +7,18 @@ use std::{
 
 use crate::api::utils::CountedBody;
 use antithesis_sdk::assert_sometimes;
-use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
+use axum::{
+    extract::{ConnectInfo, Query},
+    response::IntoResponse,
+    Extension,
+};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
     api::{
-        ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
-        TableStatResponse,
+        ColumnName, ExecResponse, ExecResult, HealthQuery, HealthResponse, QueryEvent, Statement,
+        TableStatRequest, TableStatResponse,
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
@@ -24,7 +28,6 @@ use corro_types::{
         SqliteValue,
     },
     persistent_gauge,
-    schema::{apply_schema, parse_sql},
     sqlite::{CrConn, SqlitePoolError},
 };
 use hyper::StatusCode;
@@ -32,9 +35,8 @@ use metrics::{counter, histogram};
 use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
-use spawn::spawn_counted;
 use sqlite3_parser::ast::{Cmd, Stmt as SqliteStmt};
-use sqlite_pool::{Committable, InterruptibleTransaction};
+use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
 
 use tokio::{
     sync::{
@@ -43,8 +45,7 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
 
@@ -183,12 +184,9 @@ where
     }
 
     let mut conn = agent.pool().write_priority().await?;
-    let mut book_writer = agent
-        .booked()
-        .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
-        .await;
-
     let insert_info = block_in_place(move || {
+        let bookie_write = agent.bookie().write_lock_blocking();
+        let mut book_writer = bookie_write.write_tx(agent.booked());
         let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
@@ -230,10 +228,16 @@ where
             return Ok(None);
         }
 
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.db_version),
+        tx.commit().map_err(|source| {
+            let error = ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: insert_info.as_ref().map(|info| info.db_version),
+            };
+            if let Some(issue) = error.fatal_db_issue() {
+                agent.mark_unhealthy(issue);
+            }
+            error
         })?;
 
         let committed = match insert_info {
@@ -242,10 +246,12 @@ where
                 db_version,
                 last_seq,
                 ts,
-                snap,
             }) => {
-                book_writer.commit_snapshot(snap);
-                Some((db_version, last_seq, ts))
+                book_writer.commit();
+                if let Err(error) = broadcast_changes(agent, &conn, db_version, last_seq, ts) {
+                    error!(%db_version, %error, "could not dispatch committed changes");
+                }
+                Some(db_version)
             }
         };
 
@@ -257,16 +263,11 @@ where
 
     match insert_info {
         None => Ok(SpeculativeChanges::Completed((ret, None, elapsed))),
-        Some((db_version, last_seq, ts)) => {
-            let agent = agent.clone();
-            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
-
-            Ok(SpeculativeChanges::Completed((
-                ret,
-                Some(db_version),
-                elapsed,
-            )))
-        }
+        Some(db_version) => Ok(SpeculativeChanges::Completed((
+            ret,
+            Some(db_version),
+            elapsed,
+        ))),
     }
 }
 
@@ -284,12 +285,9 @@ where
     let timeout = timeout.map(Duration::from_secs);
 
     let mut conn = agent.pool().write_priority().await?;
-    let mut book_writer = agent
-        .booked()
-        .write::<&str, _>("make_canonical_broadcastable_changes(booked writer)", None)
-        .await;
-
     let (ret, insert_info) = block_in_place(move || {
+        let bookie_write = agent.bookie().write_lock_blocking();
+        let mut book_writer = bookie_write.write_tx(agent.booked());
         let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
@@ -328,10 +326,16 @@ where
             }
         };
 
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.db_version),
+        tx.commit().map_err(|source| {
+            let error = ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: insert_info.as_ref().map(|info| info.db_version),
+            };
+            if let Some(issue) = error.fatal_db_issue() {
+                agent.mark_unhealthy(issue);
+            }
+            error
         })?;
 
         let committed = insert_info.map(
@@ -339,10 +343,12 @@ where
                  db_version,
                  last_seq,
                  ts,
-                 snap,
              }| {
-                book_writer.commit_snapshot(snap);
-                (db_version, last_seq, ts)
+                book_writer.commit();
+                if let Err(error) = broadcast_changes(agent, &conn, db_version, last_seq, ts) {
+                    error!(%db_version, %error, "could not dispatch committed changes");
+                }
+                db_version
             },
         );
 
@@ -354,12 +360,7 @@ where
 
     match insert_info {
         None => Ok((ret, None, elapsed)),
-        Some((db_version, last_seq, ts)) => {
-            let agent = agent.clone();
-            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
-
-            Ok((ret, Some(db_version), elapsed))
-        }
+        Some(db_version) => Ok((ret, Some(db_version), elapsed)),
     }
 }
 
@@ -585,6 +586,12 @@ async fn build_query_rows_response(
             }
         };
 
+        // default timeout of 1 minute if no timeout is provided
+        let timeout_secs = timeout.unwrap_or(60);
+        let timeout: Option<Duration> =
+            (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+
+        let conn = InterruptibleTransaction::new(conn.conn(), timeout, "query");
         trace!(%client_addr, "Preparing statement {}", stmt.query());
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
@@ -612,31 +619,6 @@ async fn build_query_rows_response(
             return;
         }
 
-        let timeout = timeout.unwrap_or(4);
-        let timeout: Option<Duration> = if timeout > 0 {
-            Some(Duration::from_secs(timeout * 60))
-        } else {
-            None
-        };
-
-        let int_handle = conn.get_interrupt_handle();
-        let token = CancellationToken::new();
-        if let Some(timeout) = timeout {
-            let cloned_token = token.clone();
-            let stmt_query = stmt.query().to_string();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = cloned_token.cancelled() => {}
-                    _ = tokio::time::sleep(timeout) => {
-                        warn!("sql call took more than {timeout:?}, interrupting stmt- {:?}", stmt_query);
-                        int_handle.interrupt();
-                        counter!("corro.sqlite.interrupt", "source" => "timeout").increment(1);
-                    }
-                };
-            });
-        }
-
-        let _dropguard = token.drop_guard();
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
@@ -834,109 +816,80 @@ pub async fn api_v1_queries(
     }
 }
 
-pub(crate) async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
-    let new_sql: String = statements.join(";");
+pub async fn api_v1_health(
+    Extension(agent): Extension<Agent>,
+    Query(query): Query<HealthQuery>,
+) -> (StatusCode, axum::Json<HealthResponse>) {
+    match check_health(&agent).await {
+        Ok((gaps, members)) => {
+            let status = query.failure_status.unwrap_or(503);
+            let error_status =
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let p99_lag = match agent.metrics_tracker().quantile_lag(0.99) {
+                Some(lag) => lag,
+                None => {
+                    error!("no p99 lag information available");
+                    return (
+                        error_status,
+                        axum::Json(HealthResponse::Error(
+                            "no p99 lag information available".into(),
+                        )),
+                    );
+                }
+            };
 
-    let partial_schema = parse_sql(&new_sql)?;
-
-    info!("getting write connection to update schema");
-    let mut conn = agent.pool().write_priority().await?;
-    info!("got write connection to update schema");
-
-    // hold onto this lock so nothing else makes changes
-    let mut schema_write = agent.schema().write();
-
-    // clone the previous schema and apply
-    let mut new_schema = {
-        let mut schema = schema_write.clone();
-        for (name, def) in partial_schema.tables.iter() {
-            // overwrite table because users are expected to return a full table def
-            schema.tables.insert(name.clone(), def.clone());
+            let queue_size = agent.metrics_tracker().queue_size();
+            let status = if query.gaps.is_some_and(|max| gaps > max)
+                || query.max_queue.is_some_and(|max| queue_size > max)
+                // we use queue size and p99 lag as a stronger metric for an unhealthy node
+                // since a different node that is slow to send out changes can cause worse commit lag
+                // even though the node is perfectly fine.
+                || (query.p99_lag.is_some_and(|max| p99_lag > max)
+                    && query.queue_size.is_none_or(|max| queue_size > max))
+            {
+                error_status
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                axum::Json(HealthResponse::Response {
+                    gaps,
+                    members,
+                    p99_lag,
+                    queue_size,
+                }),
+            )
         }
-        schema
+        Err(e) => {
+            error!("could not check health: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(HealthResponse::Error(e.to_string())),
+            )
+        }
+    }
+}
+
+async fn check_health(agent: &Agent) -> eyre::Result<(i64, i64)> {
+    let read_conn = match agent.pool().read().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("could not acquire read connection for health check: {e}");
+            return Err(eyre::eyre!("unable to grab write conn"));
+        }
     };
 
-    new_schema.constrain()?;
+    let gaps = read_conn
+        .prepare_cached("SELECT COALESCE(SUM(end - start + 1), 0) FROM __corro_bookkeeping_gaps")?
+        .query_row([], |row| row.get::<_, i64>(0))?;
 
-    // conn.trace(Some(|sql| debug!(sql)));
+    let members = read_conn.prepare_cached(r#"
+            SELECT COALESCE(COUNT(*), 0) FROM __corro_members WHERE json_extract(foca_state, "$.state") = "Alive""#)?
+        .query_row([], |row| row.get::<_, i64>(0))?;
 
-    let apply_res = block_in_place(|| {
-        let tx = conn.immediate_transaction()?;
-
-        apply_schema(&tx, &schema_write, &mut new_schema)?;
-
-        for tbl_name in partial_schema.tables.keys() {
-            tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
-
-            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
-            info!("Updated {n} rows in __corro_schema for table {tbl_name}");
-        }
-
-        tx.commit()?;
-
-        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
-        agent.pool().drain_read();
-
-        Ok::<_, eyre::Report>(())
-    });
-
-    // conn.trace(None);
-
-    apply_res?;
-
-    *schema_write = new_schema;
-
-    Ok(())
+    Ok((gaps, members))
 }
-
-pub async fn api_v1_db_schema(
-    Extension(agent): Extension<Agent>,
-    axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
-) -> (StatusCode, axum::Json<ExecResponse>) {
-    let actor_id = agent.actor_id().to_string();
-    if statements.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(ExecResponse {
-                results: vec![ExecResult::Error {
-                    error: "at least 1 statement is required".into(),
-                }],
-                time: 0.0,
-                version: None,
-                actor_id: Some(actor_id),
-            }),
-        );
-    }
-
-    let start = Instant::now();
-
-    assert_sometimes!(true, "Corrosion applies schema");
-    if let Err(e) = execute_schema(&agent, statements).await {
-        error!("could not merge schemas: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(ExecResponse {
-                results: vec![ExecResult::Error {
-                    error: e.to_string(),
-                }],
-                time: 0.0,
-                version: None,
-                actor_id: Some(actor_id),
-            }),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        axum::Json(ExecResponse {
-            results: vec![],
-            time: start.elapsed().as_secs_f64(),
-            version: None,
-            actor_id: Some(actor_id),
-        }),
-    )
-}
-
 /// Query the table status of the current node
 ///
 /// Currently this endpoint only supports querying the row count for a
@@ -991,7 +944,7 @@ pub async fn api_v1_table_stats(
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(TableStatResponse {
                 total_row_count: 0,
-                // Since we don't know what error occured or if any
+                // Since we don't know what error occurred or if any
                 // tables were valid, we just return an empty list
                 invalid_tables: vec![],
             }),
@@ -1005,8 +958,8 @@ mod tests {
     use corro_types::{
         api::RowId,
         base::CrsqlDbVersion,
-        broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
-        config::Config,
+        broadcast::{ChangeV1, Changeset, PlumtreeInput},
+        config::{BroadcastMethod, Config},
         schema::SqliteType,
     };
     use futures::StreamExt;
@@ -1016,7 +969,7 @@ mod tests {
 
     use super::*;
 
-    use crate::agent::setup;
+    use crate::{agent::setup, agent::util::execute_schema};
 
     async fn setup_api_test_agent() -> eyre::Result<(tempfile::TempDir, Agent)> {
         let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
@@ -1032,13 +985,7 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.into()]).await?;
 
         Ok((dir, agent))
     }
@@ -1151,12 +1098,11 @@ mod tests {
             );
         ";
 
-        let (status_code, _) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![TEST_SCHEMA.to_owned(), trigger_schema.to_owned()]),
+        execute_schema(
+            &agent,
+            vec![TEST_SCHEMA.to_owned(), trigger_schema.to_owned()],
         )
-        .await;
-        assert_eq!(status_code, StatusCode::OK);
+        .await?;
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1234,11 +1180,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_api_speculative_failure_rolls_back_and_releases_writer() -> eyre::Result<()> {
         let (_dir, agent) = setup_api_test_agent().await?;
-        let booked_before = agent
-            .booked()
-            .read::<&str, _>("test_api_speculative_failure", None)
-            .await
-            .last();
+        let booked_before = agent.booked().read().last();
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1269,11 +1211,7 @@ mod tests {
             assert_eq!(rows, 0);
         }
 
-        let booked_after = agent
-            .booked()
-            .read::<&str, _>("test_api_speculative_failure", None)
-            .await
-            .last();
+        let booked_after = agent.booked().read().last();
         assert_eq!(booked_after, booked_before);
 
         let (status_code, body) = tokio::time::timeout(
@@ -1319,11 +1257,7 @@ mod tests {
             })?;
         }
 
-        let booked_before = agent
-            .booked()
-            .read::<&str, _>("test_api_canonical_failure", None)
-            .await
-            .last();
+        let booked_before = agent.booked().read().last();
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1358,11 +1292,7 @@ mod tests {
             assert_eq!(side_rows, 0);
         }
 
-        let booked_after = agent
-            .booked()
-            .read::<&str, _>("test_api_canonical_failure", None)
-            .await
-            .last();
+        let booked_after = agent.booked().read().last();
         assert_eq!(booked_after, booked_before);
 
         let (status_code, body) = tokio::time::timeout(
@@ -1695,20 +1625,16 @@ mod tests {
                 .db_path(dir.path().join("corrosion.db").display().to_string())
                 .gossip_addr("127.0.0.1:0".parse()?)
                 .api_addr("127.0.0.1:0".parse()?)
+                .broadcast_method(BroadcastMethod::Plumtree)
                 .build()?,
             tripwire,
         )
         .await?;
 
         let rx_bcast = &mut agent_options.rx_bcast;
+        let rx_plumtree = &mut agent_options.rx_plumtree;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.to_owned()]).await?;
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1726,26 +1652,23 @@ mod tests {
 
         assert!(body.0.results.len() == 1);
 
-        let msg = rx_bcast
+        let msg = rx_plumtree
             .recv()
             .await
             .expect("not msg received on bcast channel");
 
         assert!(matches!(
             msg,
-            BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
+            PlumtreeInput::Broadcast(ChangeV1 {
                 changeset: Changeset::FullV2 {
                     version: CrsqlDbVersion(1),
                     ..
                 },
                 ..
-            }))
+            })
         ));
 
-        assert_eq!(
-            agent.booked().read::<&str, _>("test", None).await.last(),
-            Some(CrsqlDbVersion(1))
-        );
+        assert_eq!(agent.booked().read().last(), Some(CrsqlDbVersion(1)));
 
         println!("second req...");
 
@@ -1771,6 +1694,143 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_dispatch_does_not_wait_for_query_readers_speculative() -> eyre::Result<()> {
+        check_committed_dispatch_with_query_readers(false).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_dispatch_does_not_wait_for_query_readers_canonical() -> eyre::Result<()> {
+        check_committed_dispatch_with_query_readers(true).await
+    }
+
+    async fn check_committed_dispatch_with_query_readers(canonical: bool) -> eyre::Result<()> {
+        use corro_types::{api::NotifyEvent, pubsub::ChangeType};
+
+        let (tripwire, _worker, _shutdown) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+        let (agent, mut options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .broadcast_method(BroadcastMethod::Plumtree)
+                .build()?,
+            tripwire.clone(),
+        )
+        .await?;
+        execute_schema(
+            &agent,
+            vec![
+                corro_tests::TEST_SCHEMA.to_owned(),
+                "CREATE TABLE exports (id INTEGER NOT NULL PRIMARY KEY, payload TEXT NOT NULL DEFAULT '')".into(),
+            ],
+        )
+        .await?;
+        let (status, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            Query(TimeoutParams::default()),
+            axum::Json(vec![Statement::Simple(
+                "WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<1024)
+                 INSERT INTO exports SELECT id, 'payload' FROM ids"
+                    .into(),
+            )]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0.version, Some(1));
+
+        let (_handle, created) = agent.updates_manager().get_or_insert(
+            "tests",
+            &agent.schema().read(),
+            agent.pool(),
+            tripwire,
+        )?;
+        let mut updates = created.expect("new updates handle").evt_rx;
+        let mut responses = Vec::new();
+        for (version, id) in [(2, 202_i64), (3, 101_i64)] {
+            if version == 3 {
+                // Every successful response has acquired a reader. Unconsumed
+                // bodies fill the bounded queues before the 1024-row query ends.
+                for _ in 0..20 {
+                    let response = api_v1_queries(
+                        Extension(agent.clone()),
+                        ConnectInfo("127.0.0.1:12345".parse()?),
+                        Query(TimeoutParams::default()),
+                        axum::Json(Statement::Simple("SELECT id, payload FROM exports".into())),
+                    )
+                    .await
+                    .into_response();
+                    assert_eq!(response.status(), StatusCode::OK);
+                    responses.push(response);
+                }
+            }
+            let table = if canonical { "main.tests" } else { "tests" };
+            let statements = vec![Statement::WithParams(
+                format!("INSERT INTO {table} (id, text) VALUES (?, ?)").into(),
+                vec![id.into(), "committed".into()],
+            )];
+            assert_eq!(
+                replayable_transaction_tables(&agent, &statements).is_none(),
+                canonical
+            );
+            let (status, body) = api_v1_transactions(
+                Extension(agent.clone()),
+                Query(TimeoutParams::default()),
+                axum::Json(statements),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.0.version, Some(version));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), updates.recv())
+                    .await
+                    .expect("committed write must notify while query responses hold all readers")
+                    .expect("updates channel closed"),
+                NotifyEvent::Notify(ChangeType::Update, pks) if pks == vec![id.into()]
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let message = options
+                        .rx_plumtree
+                        .recv()
+                        .await
+                        .expect("plumtree channel closed");
+                    if let PlumtreeInput::Broadcast(ChangeV1 {
+                        changeset:
+                            Changeset::FullV2 {
+                                version: actual,
+                                changes,
+                                ..
+                            },
+                        ..
+                    }) = message
+                    {
+                        if actual == CrsqlDbVersion(version) {
+                            assert!(changes.matchable_changes().any(|change| change
+                                .table
+                                .as_str()
+                                == "tests"
+                                && change.column.as_str() == "text"));
+                            break;
+                        }
+                        assert_eq!(
+                            actual,
+                            CrsqlDbVersion(1),
+                            "only fixture chunks may precede the write"
+                        );
+                    } else {
+                        panic!("unexpected plumtree message");
+                    }
+                }
+            })
+            .await
+            .expect("committed write must broadcast while query responses hold all readers");
+        }
+        drop(responses);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_query() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
@@ -1789,13 +1849,7 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.to_owned()]).await?;
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1901,15 +1955,14 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![
+        execute_schema(
+            &agent,
+            vec![
+                "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
-            ]),
+            ],
         )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        .await?;
 
         // scope the schema reader in here
         {
@@ -1932,16 +1985,14 @@ mod tests {
             assert!(!foo_col.primary_key);
         }
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![
+        execute_schema(
+            &agent,
+            vec![
                 "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
-            ]),
+            ],
         )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        .await?;
 
         {
             let schema = agent.schema().read();
@@ -2005,13 +2056,7 @@ mod tests {
             );
         }
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![create_stmt.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![create_stmt.to_owned()]).await?;
 
         {
             let schema = agent.schema().read();

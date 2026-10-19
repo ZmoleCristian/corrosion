@@ -21,10 +21,9 @@ use std::{
 };
 
 use chrono::NaiveDateTime;
-use codec::PgWireMessageServerCodec;
 use compact_str::CompactString;
 use corro_types::{
-    agent::{Agent, ChangeError},
+    agent::{Agent, BookieWriteGuard, ChangeError},
     broadcast::{broadcast_changes, Timestamp},
     change::{
         database_has_foreign_keys, database_has_user_triggers, database_schema_version,
@@ -40,6 +39,7 @@ use futures::{SinkExt, StreamExt};
 use metrics::counter;
 use pgwire::{
     api::results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
+    api::DefaultClient,
     error::{ErrorInfo, PgWireError},
     messages::{
         data::{NoData, ParameterDescription, RowDescription},
@@ -50,13 +50,17 @@ use pgwire::{
         startup::ParameterStatus,
         PgWireBackendMessage, PgWireFrontendMessage,
     },
-    types::FromSqlText,
+    tokio::server::PgWireMessageServerCodec,
+    types::{format::FormatOptions, FromSqlText},
 };
 use postgres_types::{FromSql, Type};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{
-    ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
-    vtab::eponymous_only_module, Connection, Statement,
+    ffi::SQLITE_CONSTRAINT_UNIQUE,
+    functions::{Aggregate, Context as SqliteCtx, FunctionFlags},
+    types::ValueRef,
+    vtab::eponymous_only_module,
+    Connection, Statement,
 };
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
@@ -83,9 +87,35 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
-        pg_class::PgClassTable,
+        empty_catalog::{
+            EmptyCatalogTable, PG_ATTRDEF_DDL, PG_AVAILABLE_EXTENSIONS_DDL, PG_CONVERSION_DDL,
+            PG_DEPEND_DDL, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL, PG_INHERITS_DDL, PG_OPCLASS_DDL,
+            PG_OPFAMILY_DDL, PG_SHDESCRIPTION_DDL, PG_STATIO_USER_TABLES_DDL, PG_TRIGGER_DDL,
+        },
+        information_schema_columns::{
+            load_information_schema_columns, InformationSchemaColumnsTable,
+        },
+        information_schema_key_column_usage::{
+            load_information_schema_key_column_usage, InformationSchemaKeyColumnUsageTable,
+        },
+        information_schema_table_constraints::{
+            load_information_schema_table_constraints, InformationSchemaTableConstraintsTable,
+        },
+        information_schema_tables::{
+            load_information_schema_table_names, InformationSchemaTablesTable,
+        },
+        information_schema_triggers::{
+            load_information_schema_triggers, InformationSchemaTriggersTable,
+        },
+        pg_am::PgAmTable,
+        pg_attribute::{load_pg_attributes, PgAttributeTable},
+        pg_class::{load_pg_class_entries, PgClassTable},
+        pg_constraint::{load_pg_constraint_entries, PgConstraintTable},
         pg_database::{PgDatabase, PgDatabaseTable},
+        pg_index::{load_pg_index_entries, PgIndexTable},
+        pg_language::{load_pg_language_entries, PgLanguageTable},
         pg_namespace::PgNamespaceTable,
+        pg_proc::{load_pg_proc_entries, PgProcTable},
         pg_range::PgRangeTable,
         pg_type::PgTypeTable,
     },
@@ -245,7 +275,11 @@ impl ParsedCmd {
     }
 
     pub fn is_rollback(&self) -> bool {
-        matches!(self, ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback { .. })))
+        matches!(
+            self,
+            ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback { .. }))
+                | ParsedCmd::Postgres(PgStatement::Rollback { .. })
+        )
     }
 
     pub fn is_pg(&self) -> bool {
@@ -297,6 +331,7 @@ impl ParsedCmd {
             ParsedCmd::Postgres(stmt) => match stmt {
                 PgStatement::StartTransaction { .. } => StmtTag::Begin,
                 PgStatement::Commit { .. } => StmtTag::Commit,
+                PgStatement::Rollback { .. } => StmtTag::Rollback,
                 _ => StmtTag::Other,
             },
             _ => StmtTag::Other,
@@ -321,14 +356,78 @@ pub enum ParseError {
     Postgres(#[from] sqlparser::parser::ParserError),
 }
 
-fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
+/// Convert PostgreSQL-style backreferences (\1, \2, ...) in a replacement
+/// string to the `regex` crate's format ($1, $2, ...).
+fn convert_pg_backrefs(replacement: &str) -> String {
+    let mut result = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    chars.next();
+                    result.push('$');
+                    result.push(next);
+                    continue;
+                }
+            }
+        }
+        result.push(c);
+    }
+    result
+}
+
+/// Accumulator for string_agg(value, delimiter).
+struct StringAggCtx {
+    parts: Vec<String>,
+    delimiter: String,
+}
+
+/// Aggregate for string_agg(value, delimiter).
+struct StringAgg;
+
+impl Aggregate<StringAggCtx, String> for StringAgg {
+    fn init(&self, _ctx: &mut SqliteCtx<'_>) -> rusqlite::Result<StringAggCtx> {
+        Ok(StringAggCtx {
+            parts: Vec::new(),
+            delimiter: String::new(),
+        })
+    }
+
+    fn step(&self, ctx: &mut SqliteCtx<'_>, acc: &mut StringAggCtx) -> rusqlite::Result<()> {
+        let value: Option<String> = ctx.get(0).unwrap_or(None);
+        if acc.delimiter.is_empty() {
+            acc.delimiter = ctx.get(1).unwrap_or_default();
+        }
+        if let Some(v) = value {
+            acc.parts.push(v);
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &mut SqliteCtx<'_>,
+        acc: Option<StringAggCtx>,
+    ) -> rusqlite::Result<String> {
+        let acc = acc.unwrap_or(StringAggCtx {
+            parts: Vec::new(),
+            delimiter: String::new(),
+        });
+        Ok(acc.parts.join(&acc.delimiter))
+    }
+}
+
+fn parse_query(sql: &str) -> Result<(String, VecDeque<ParsedCmd>), ParseError> {
     let mut cmds = VecDeque::new();
 
     let normalized = sql.trim_matches(';').trim();
     if normalized.is_empty() {
-        return Ok(cmds);
+        return Ok((normalized.to_string(), cmds));
     }
 
+    // First, try parsing with the SQLite parser directly — this is the fast
+    // path for all SQLite-compatible SQL.
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(normalized.as_bytes());
     loop {
         match parser.next() {
@@ -336,34 +435,962 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
                 cmds.push_back(ParsedCmd::Sqlite(cmd));
             }
             Ok(None) => {
-                break;
+                return Ok((normalized.to_string(), cmds));
             }
             Err(e) => {
                 debug!("could not parse statement ({sql:?}) as sqlite: {e}");
-                let stmts = sqlparser::parser::Parser::parse_sql(
-                    &sqlparser::dialect::PostgreSqlDialect {},
-                    normalized,
-                )?;
-                for stmt in stmts {
-                    cmds.push_back(ParsedCmd::Postgres(stmt));
-                }
                 break;
             }
         }
     }
 
-    Ok(cmds)
+    // The SQLite parser failed.  Try parsing with the PostgreSQL parser, then
+    // strip PG-specific syntax from the AST (e.g. `::type` casts and
+    // `pg_catalog.function()` prefixes) and re-serialize to a SQLite-compatible
+    // SQL string.  If that string can be parsed by the SQLite parser, we use
+    // it — otherwise we fall back to the PG-parsed statement (which will only
+    // work for a limited set of statements like BEGIN/COMMIT/SET/SHOW).
+
+    let stmts = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        normalized,
+    )?;
+
+    // Try to convert each PG statement to a SQLite-compatible string.
+    let mut sqlite_compat_sql = String::new();
+    let mut all_convertible = true;
+    for stmt in &stmts {
+        match pg_stmt_to_sqlite_sql(stmt) {
+            Some(converted) => {
+                if !sqlite_compat_sql.is_empty() {
+                    sqlite_compat_sql.push_str("; ");
+                }
+                sqlite_compat_sql.push_str(&converted);
+            }
+            None => {
+                all_convertible = false;
+                break;
+            }
+        }
+    }
+
+    if all_convertible && !sqlite_compat_sql.is_empty() {
+        // Try parsing the converted SQL with the SQLite parser.
+        let mut parser = sqlite3_parser::lexer::sql::Parser::new(sqlite_compat_sql.as_bytes());
+        let mut sqlite_cmds = VecDeque::new();
+        let mut success = true;
+        loop {
+            match parser.next() {
+                Ok(Some(cmd)) => {
+                    sqlite_cmds.push_back(ParsedCmd::Sqlite(cmd));
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(e) => {
+                    debug!(
+                        "could not parse PG-converted statement ({sqlite_compat_sql:?}) as sqlite: {e}"
+                    );
+                    success = false;
+                    break;
+                }
+            }
+        }
+        if success && !sqlite_cmds.is_empty() {
+            return Ok((sqlite_compat_sql, sqlite_cmds));
+        }
+    }
+
+    // Fall back to the PG-parsed statements.
+    for stmt in stmts {
+        cmds.push_back(ParsedCmd::Postgres(stmt));
+    }
+
+    Ok((normalized.to_string(), cmds))
 }
 
-#[derive(Debug, Default)]
+/// Attempts to convert a `sqlparser` AST statement into a SQLite-compatible SQL
+/// string by stripping PostgreSQL-specific constructs.  Returns `None` if the
+/// statement type is not supported for conversion.
+///
+/// The main transformations are:
+///   - `expr::type` casts → just `expr` (SQLite is dynamically typed)
+///   - `pg_catalog.function(...)` → `function(...)` (SQLite doesn't support
+///     schema-qualified function calls)
+fn pg_stmt_to_sqlite_sql(stmt: &PgStatement) -> Option<String> {
+    use sqlparser::ast::Statement as S;
+
+    match stmt {
+        S::Query(query) => {
+            let mut query = query.clone();
+            strip_pg_ast_query(&mut query);
+            Some(query.to_string())
+        }
+        // Other statement types are handled as PG statements elsewhere
+        // (BEGIN/COMMIT/SET/SHOW) or are not supported.
+        _ => None,
+    }
+}
+
+/// Recursively strips PG-specific syntax from a `Query` AST.
+fn strip_pg_ast_query(query: &mut sqlparser::ast::Query) {
+    strip_pg_ast_set_expr(&mut query.body);
+    if let Some(ref mut order_by) = query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut order_by.kind {
+            for item in exprs.iter_mut() {
+                strip_pg_ast_expr(&mut item.expr);
+            }
+        }
+    }
+}
+
+/// Recursively strips PG-specific syntax from a `SetExpr`.
+fn strip_pg_ast_set_expr(set_expr: &mut sqlparser::ast::SetExpr) {
+    use sqlparser::ast::SetExpr;
+    match set_expr {
+        SetExpr::Select(select) => {
+            for item in select.projection.iter_mut() {
+                strip_pg_ast_select_item(item);
+            }
+            for table_with_joins in select.from.iter_mut() {
+                strip_pg_ast_table_with_joins(table_with_joins);
+            }
+            if let Some(ref mut expr) = select.selection {
+                strip_pg_ast_expr(expr);
+            }
+            if let Some(ref mut expr) = select.having {
+                strip_pg_ast_expr(expr);
+            }
+        }
+        SetExpr::Query(query) => strip_pg_ast_query(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            strip_pg_ast_set_expr(left);
+            strip_pg_ast_set_expr(right);
+        }
+        _ => {}
+    }
+}
+
+/// Quotes an identifier if it is a SQLite reserved keyword, so that it can be
+/// used as an alias or column name without causing a syntax error.
+fn quote_sqlite_keyword(ident: &mut sqlparser::ast::Ident) {
+    if ident.quote_style.is_some() {
+        return; // already quoted
+    }
+    if is_sqlite_keyword(&ident.value) {
+        ident.quote_style = Some('"');
+    }
+}
+
+/// Returns true if the given identifier (case-insensitive) is a SQLite reserved
+/// keyword that cannot be used as an unquoted alias.
+fn is_sqlite_keyword(s: &str) -> bool {
+    // This is not the full SQLite keyword list — just the ones that are
+    // commonly used as column/alias names by PostgreSQL tools like TablePlus
+    // and that conflict with SQLite's parser.
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "CHECK"
+            | "CONSTRAINT"
+            | "KEY"
+            | "INDEX"
+            | "TABLE"
+            | "COLUMN"
+            | "DEFAULT"
+            | "NULL"
+            | "PRIMARY"
+            | "UNIQUE"
+            | "FOREIGN"
+            | "REFERENCES"
+            | "CAST"
+            | "COLLATE"
+            | "CONFLICT"
+            | "FILTER"
+            | "ROW"
+            | "ROWS"
+            | "VALUES"
+            | "VIEW"
+            | "TEMP"
+            | "TEMPORARY"
+            | "TRIGGER"
+            | "BEGIN"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "END"
+            | "EXPLAIN"
+            | "PRAGMA"
+            | "REPLACE"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "INNER"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "JOIN"
+            | "ON"
+            | "USING"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "WHERE"
+            | "FROM"
+            | "INTO"
+            | "SET"
+            | "BY"
+            | "AS"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "IN"
+            | "IS"
+            | "LIKE"
+            | "GLOB"
+            | "BETWEEN"
+            | "ESCAPE"
+            | "EXISTS"
+            | "DISTINCT"
+            | "ALL"
+            | "CASE"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "IF"
+            | "MATCH"
+            | "ASC"
+            | "DESC"
+            | "LIMIT"
+            | "OFFSET"
+            | "AUTOINCREMENT"
+            | "ADD"
+            | "ALTER"
+            | "DROP"
+            | "RENAME"
+            | "TO"
+            | "CREATE"
+            | "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "WITH"
+            | "RECURSIVE"
+            | "MATERIALIZED"
+            | "WINDOW"
+            | "OVER"
+            | "PARTITION"
+            | "RETURNING"
+            | "RAISE"
+            | "ABORT"
+            | "ACTION"
+            | "AFTER"
+            | "BEFORE"
+            | "FAIL"
+            | "IGNORE"
+            | "RESTRICT"
+            | "CASCADE"
+            | "DEFERRABLE"
+            | "DEFERRED"
+            | "IMMEDIATE"
+            | "INITIALLY"
+            | "DEFER"
+            | "EXCLUSIVE"
+            | "SHARED"
+            | "UNLOCKED"
+    )
+}
+
+/// Builds a JSON array string from a slice of strings, properly escaping
+/// each element.  Used by `string_to_array` and `parse_ident` to represent
+/// PG arrays as JSON arrays (since SQLite has no native array type).
+fn json_array(parts: &[String]) -> String {
+    let items: Vec<String> = parts
+        .iter()
+        .map(|s| {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{escaped}\"")
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Converts a PG array literal like `{a,b,c}` to a JSON array string.
+fn pg_array_to_json(s: &str) -> String {
+    let trimmed = s.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return format!("[\"{}\"]", trimmed.replace('"', "\\\""));
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    if inner.is_empty() {
+        return "[]".to_string();
+    }
+    let parts: Vec<String> = inner.split(',').map(String::from).collect();
+    json_array(&parts)
+}
+
+/// Parses a PostgreSQL qualified identifier string (e.g. `"schema"."table"`
+/// or `schema.table`) into its component parts.
+fn parse_pg_ident(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut chars = s.chars().peekable();
+    while chars.peek().is_some() {
+        // Skip whitespace
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        if chars.peek() == Some(&'"') {
+            // Quoted identifier
+            chars.next(); // consume opening quote
+            let mut part = String::new();
+            while let Some(&c) = chars.peek() {
+                chars.next();
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        // Escaped double quote
+                        chars.next();
+                        part.push('"');
+                    } else {
+                        break;
+                    }
+                } else {
+                    part.push(c);
+                }
+            }
+            parts.push(part);
+        } else {
+            // Unquoted identifier — read until dot or whitespace
+            let mut part = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '.' || c.is_whitespace() {
+                    break;
+                }
+                part.push(c);
+                chars.next();
+            }
+            parts.push(part);
+        }
+        // Skip whitespace
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        // Consume dot separator
+        if chars.peek() == Some(&'.') {
+            chars.next();
+        }
+    }
+    parts
+}
+
+/// Strips PG-specific syntax from a `SelectItem`.
+fn strip_pg_ast_select_item(item: &mut sqlparser::ast::SelectItem) {
+    use sqlparser::ast::SelectItem;
+    match item {
+        SelectItem::ExprWithAlias { expr, alias } => {
+            strip_pg_ast_expr(expr);
+            quote_sqlite_keyword(alias);
+        }
+        SelectItem::UnnamedExpr(expr) => strip_pg_ast_expr(expr),
+        _ => {}
+    }
+}
+
+/// Strips PG-specific syntax from a `TableWithJoins`.
+fn strip_pg_ast_table_with_joins(table_with_joins: &mut sqlparser::ast::TableWithJoins) {
+    strip_pg_ast_table_factor(&mut table_with_joins.relation);
+    for join in table_with_joins.joins.iter_mut() {
+        strip_pg_ast_table_factor(&mut join.relation);
+        match &mut join.join_operator {
+            sqlparser::ast::JoinOperator::Join(constraint)
+            | sqlparser::ast::JoinOperator::Inner(constraint)
+            | sqlparser::ast::JoinOperator::Left(constraint)
+            | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+            | sqlparser::ast::JoinOperator::Right(constraint)
+            | sqlparser::ast::JoinOperator::RightOuter(constraint)
+            | sqlparser::ast::JoinOperator::FullOuter(constraint)
+            | sqlparser::ast::JoinOperator::Semi(constraint)
+            | sqlparser::ast::JoinOperator::LeftSemi(constraint)
+            | sqlparser::ast::JoinOperator::RightSemi(constraint)
+            | sqlparser::ast::JoinOperator::Anti(constraint)
+            | sqlparser::ast::JoinOperator::LeftAnti(constraint)
+            | sqlparser::ast::JoinOperator::RightAnti(constraint) => {
+                if let sqlparser::ast::JoinConstraint::On(expr) = constraint {
+                    strip_pg_ast_expr(expr);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Strips PG-specific syntax from a `TableFactor` (mainly schema-qualified
+/// function calls in table function context).
+fn strip_pg_ast_table_factor(table_factor: &mut sqlparser::ast::TableFactor) {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, TableFactor};
+
+    // Helper: convert a scalar function used as a table factor into a
+    // derived subquery `(SELECT func(args) AS col) alias`.
+    // Also converts `generate_series(start, end) AS i` to
+    // `(SELECT value AS i FROM generate_series(start, end)) AS i`
+    // so that the column is accessible by the alias name.
+    // Returns true if the conversion was performed.
+    fn try_convert_scalar_table_func(
+        table_factor: &mut TableFactor,
+        name: &sqlparser::ast::ObjectName,
+        args: &[FunctionArg],
+        alias: &Option<sqlparser::ast::TableAlias>,
+    ) -> bool {
+        let func_name = name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|p| p.value.to_ascii_lowercase())
+            .unwrap_or_default();
+        const SCALAR_FUNCS: &[&str] = &[
+            "string_to_array",
+            "current_setting",
+            "parse_ident",
+            "array_to_string",
+        ];
+
+        let alias_name = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| "col".to_string());
+
+        let subquery_sql = if SCALAR_FUNCS.contains(&func_name.as_str()) {
+            // Scalar function: wrap in (SELECT func(args) AS alias_name)
+            let func_call = format!(
+                "{}({})",
+                name,
+                args.iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            format!("SELECT {} AS \"{}\"", func_call, alias_name)
+        } else if func_name == "generate_series" {
+            // generate_series: wrap in (SELECT value AS alias_name FROM generate_series(...))
+            let func_call = format!(
+                "{}({})",
+                name,
+                args.iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            format!("SELECT value AS \"{}\" FROM {}", alias_name, func_call)
+        } else {
+            return false;
+        };
+
+        // Parse the subquery and replace the table factor
+        if let Ok(sub_stmts) = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            &subquery_sql,
+        ) {
+            if let Some(sqlparser::ast::Statement::Query(sub_query)) = sub_stmts.into_iter().next()
+            {
+                *table_factor = TableFactor::Derived {
+                    lateral: false,
+                    subquery: sub_query,
+                    alias: alias.clone(),
+                };
+                return true;
+            }
+        }
+        false
+    }
+
+    match table_factor {
+        TableFactor::Function {
+            name, args, alias, ..
+        } => {
+            strip_pg_catalog_prefix(name);
+            // Process args first
+            for arg in args.iter_mut() {
+                let func_arg_expr = match arg {
+                    FunctionArg::Named { arg, .. } => arg,
+                    FunctionArg::ExprNamed { arg, .. } => arg,
+                    FunctionArg::Unnamed(expr) => expr,
+                };
+                if let FunctionArgExpr::Expr(e) = func_arg_expr {
+                    strip_pg_ast_expr(e);
+                }
+            }
+            let name_clone = name.clone();
+            let args_clone = args.clone();
+            let alias_clone = alias.clone();
+            try_convert_scalar_table_func(table_factor, &name_clone, &args_clone, &alias_clone);
+        }
+        TableFactor::Table {
+            name,
+            args: Some(table_args),
+            alias,
+            ..
+        } => {
+            strip_pg_catalog_prefix(name);
+            // Process args
+            for arg in table_args.args.iter_mut() {
+                let func_arg_expr = match arg {
+                    FunctionArg::Named { arg, .. } => arg,
+                    FunctionArg::ExprNamed { arg, .. } => arg,
+                    FunctionArg::Unnamed(expr) => expr,
+                };
+                if let FunctionArgExpr::Expr(e) = func_arg_expr {
+                    strip_pg_ast_expr(e);
+                }
+            }
+            let name_clone = name.clone();
+            let args_clone = table_args.args.clone();
+            let alias_clone = alias.clone();
+            try_convert_scalar_table_func(table_factor, &name_clone, &args_clone, &alias_clone);
+        }
+        TableFactor::Table {
+            name: _,
+            args: None,
+            ..
+        } => {
+            // Don't strip pg_catalog. prefix from regular table references —
+            // SQLite supports schema.table syntax and the pg_catalog vtabs
+            // are registered with that schema prefix.
+        }
+        TableFactor::Derived { subquery, .. } => {
+            strip_pg_ast_query(subquery);
+        }
+        _ => {}
+    }
+}
+
+/// Strips the `pg_catalog.` (or other schema) prefix from an `ObjectName` if
+/// it has more than one part, leaving just the last part (the function name).
+fn strip_pg_catalog_prefix(name: &mut sqlparser::ast::ObjectName) {
+    if name.0.len() > 1 {
+        // Keep only the last part (the function/table name).
+        let last = name.0.pop().unwrap();
+        name.0 = vec![last];
+    }
+}
+
+/// Recursively strips PG-specific syntax from function arguments.
+fn strip_pg_ast_function_args(args: &mut sqlparser::ast::FunctionArguments) {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    if let FunctionArguments::List(arg_list) = args {
+        for arg in arg_list.args.iter_mut() {
+            let func_arg_expr = match arg {
+                FunctionArg::Named { arg, .. } => arg,
+                FunctionArg::ExprNamed { arg, .. } => arg,
+                FunctionArg::Unnamed(expr) => expr,
+            };
+            if let FunctionArgExpr::Expr(e) = func_arg_expr {
+                strip_pg_ast_expr(e);
+            }
+        }
+    }
+}
+/// Maps a PostgreSQL `DataType` to a SQLite-compatible `DataType`.
+///
+/// SQLite's CAST only cares about type affinity (INTEGER, REAL, TEXT, BLOB,
+/// NUMERIC), but the corrosion engine's `name_to_type` function maps a
+/// specific set of type names to PostgreSQL wire types.  This function
+/// converts PG-specific type aliases (e.g. `INT8`, `FLOAT8`) to the
+/// canonical names that `name_to_type` recognizes (e.g. `BIGINT`, `DOUBLE
+/// PRECISION`).
+fn pg_data_type_to_sqlite(dt: sqlparser::ast::DataType) -> sqlparser::ast::DataType {
+    use sqlparser::ast::DataType;
+    match dt {
+        // Integer types → BIGINT (maps to Type::INT8 in name_to_type)
+        DataType::Int2(_) | DataType::Int4(_) | DataType::Int8(_) | DataType::SmallInt(_) => {
+            DataType::BigInt(None)
+        }
+        // Floating-point types → DoublePrecision (maps to Type::FLOAT8)
+        DataType::Real | DataType::Float(_) | DataType::Double(_) | DataType::Float8 => {
+            DataType::DoublePrecision
+        }
+        // Boolean → BOOLEAN (maps to Type::BOOL)
+        DataType::Bool => DataType::Boolean,
+        // Bytea → BLOB (maps to Type::BYTEA)
+        DataType::Bytea => DataType::Blob(None),
+        // Text types → TEXT (maps to Type::TEXT)
+        DataType::Varchar(_) | DataType::CharVarying(_) | DataType::CharacterVarying(_) => {
+            DataType::Text
+        }
+        // Timestamp → TIMESTAMP (maps to Type::TIMESTAMP)
+        DataType::Timestamp(_, _) => DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None),
+        // Pass through types that are already SQLite-compatible
+        other => other,
+    }
+}
+
+/// Builds a simple `Function` AST node for a function call with unnamed args.
+fn make_sqlite_function(name: &str, args: Vec<sqlparser::ast::Expr>) -> sqlparser::ast::Function {
+    use sqlparser::ast::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+        ObjectName, ObjectNamePart,
+    };
+    Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    }
+}
+
+/// Recursively strips PG-specific syntax from an `Expr`.  The main
+/// transformation is converting `::type` casts to `CAST(expr AS type)` with
+/// SQLite-compatible type names.
+fn strip_pg_ast_expr(outer_expr: &mut sqlparser::ast::Expr) {
+    use sqlparser::ast::Expr;
+
+    match outer_expr {
+        // Convert `expr::type` (DoubleColon) casts to `CAST(expr AS type)`
+        // which SQLite understands, and map PG-specific type names to
+        // SQLite-compatible ones.  `CAST(...)` casts are also normalized.
+        Expr::Cast {
+            kind,
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            strip_pg_ast_expr(inner);
+            *kind = sqlparser::ast::CastKind::Cast;
+            *data_type = pg_data_type_to_sqlite(data_type.clone());
+        }
+        Expr::Function(func) => {
+            strip_pg_catalog_prefix(&mut func.name);
+            // In PG, `user` is a special keyword equivalent to `current_user`.
+            // The PG parser produces it as Expr::Function with no args.
+            // SQLite doesn't have this, so convert to a string literal.
+            if let Some(ident) = func.name.0.last().and_then(|p| p.as_ident()) {
+                if ident.value.eq_ignore_ascii_case("user")
+                    && ident.quote_style.is_none()
+                    && matches!(func.args, sqlparser::ast::FunctionArguments::None)
+                {
+                    *outer_expr = Expr::Value(
+                        sqlparser::ast::Value::SingleQuotedString("corro".into()).into(),
+                    );
+                    return;
+                }
+            }
+            strip_pg_ast_function_args(&mut func.args);
+            if let Some(ref mut filter) = func.filter {
+                strip_pg_ast_expr(filter);
+            }
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Wildcard(_) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            strip_pg_ast_expr(left);
+            strip_pg_ast_expr(right);
+        }
+        Expr::UnaryOp { expr, .. } => strip_pg_ast_expr(expr),
+        Expr::IsNull(expr) | Expr::IsNotNull(expr) | Expr::IsTrue(expr) | Expr::IsFalse(expr) => {
+            strip_pg_ast_expr(expr)
+        }
+        Expr::InList { expr, list, .. } => {
+            strip_pg_ast_expr(expr);
+            for e in list {
+                strip_pg_ast_expr(e);
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_query(subquery);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(low);
+            strip_pg_ast_expr(high);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(pattern);
+        }
+        Expr::ILike { expr, pattern, .. } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(pattern);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                strip_pg_ast_expr(op);
+            }
+            for case_when in conditions.iter_mut() {
+                strip_pg_ast_expr(&mut case_when.condition);
+                strip_pg_ast_expr(&mut case_when.result);
+            }
+            if let Some(er) = else_result {
+                strip_pg_ast_expr(er);
+            }
+        }
+        Expr::Subquery(query) => strip_pg_ast_query(query),
+        Expr::Exists { subquery, .. } => strip_pg_ast_query(subquery),
+        Expr::Nested(inner) => strip_pg_ast_expr(inner),
+        Expr::Extract { expr, .. } => strip_pg_ast_expr(expr),
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            strip_pg_ast_expr(expr);
+            if let Some(tw) = trim_what {
+                strip_pg_ast_expr(tw);
+            }
+            if let Some(tcs) = trim_characters {
+                for tc in tcs {
+                    strip_pg_ast_expr(tc);
+                }
+            }
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(overlay_what);
+            strip_pg_ast_expr(overlay_from);
+            if let Some(of) = overlay_for {
+                strip_pg_ast_expr(of);
+            }
+        }
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            strip_pg_ast_expr(timestamp);
+            strip_pg_ast_expr(time_zone);
+        }
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            strip_pg_ast_expr(left);
+            strip_pg_ast_expr(right);
+        }
+        Expr::IsUnknown(expr) | Expr::IsNotUnknown(expr) => strip_pg_ast_expr(expr),
+        // Convert `POSITION(substr IN str)` to `INSTR(str, substr)` which
+        // SQLite understands.  SQLite doesn't support the POSITION...IN syntax.
+        Expr::Position {
+            expr: substr,
+            r#in: in_str,
+        } => {
+            strip_pg_ast_expr(substr);
+            strip_pg_ast_expr(in_str);
+            let in_expr = (**in_str).clone();
+            let substr_expr = (**substr).clone();
+            *outer_expr = Expr::Function(make_sqlite_function("INSTR", vec![in_expr, substr_expr]));
+        }
+        // Convert PG array subscript `arr[i]` (parsed as JsonAccess) to `json_extract(arr, '$[' || (i - 1) || ']')`.
+        // PG arrays are 1-indexed; JSON arrays are 0-indexed, so we subtract 1.
+        Expr::JsonAccess { value, path } => {
+            strip_pg_ast_expr(value);
+            if path.path.len() == 1 {
+                if let sqlparser::ast::JsonPathElem::Bracket { key } = &path.path[0] {
+                    let mut idx_expr = key.clone();
+                    strip_pg_ast_expr(&mut idx_expr);
+                    let arr_expr = (**value).clone();
+                    // Build json_extract(arr, '$[' || ((idx) - 1) || ']')
+                    let idx_minus_1 = Expr::Nested(Box::new(Expr::BinaryOp {
+                        left: Box::new(idx_expr),
+                        op: sqlparser::ast::BinaryOperator::Minus,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::Number("1".into(), false).into(),
+                        )),
+                    }));
+                    let path_expr = Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Value(
+                                sqlparser::ast::Value::SingleQuotedString("$[".into()).into(),
+                            )),
+                            op: sqlparser::ast::BinaryOperator::StringConcat,
+                            right: Box::new(idx_minus_1),
+                        }),
+                        op: sqlparser::ast::BinaryOperator::StringConcat,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::SingleQuotedString("]".into()).into(),
+                        )),
+                    };
+                    *outer_expr = Expr::Function(make_sqlite_function(
+                        "json_extract",
+                        vec![arr_expr, path_expr],
+                    ));
+                }
+            }
+        }
+        // Convert PG array subscript `arr[i]` to `json_extract(arr, '$[i-1]')`.
+        // PG arrays are 1-indexed; JSON arrays are 0-indexed, so we subtract 1.
+        // Only handles a single subscript index (not slices).
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            strip_pg_ast_expr(root);
+            if access_chain.len() == 1 {
+                if let sqlparser::ast::AccessExpr::Subscript(sqlparser::ast::Subscript::Index {
+                    index,
+                }) = &access_chain[0]
+                {
+                    let mut idx_expr = index.clone();
+                    strip_pg_ast_expr(&mut idx_expr);
+                    let arr_expr = (**root).clone();
+                    // Build json_extract(arr, '$[' || (idx - 1) || ']')
+                    // PG arrays are 1-indexed; JSON arrays are 0-indexed.
+                    let idx_minus_1 = Expr::Nested(Box::new(Expr::BinaryOp {
+                        left: Box::new(idx_expr),
+                        op: sqlparser::ast::BinaryOperator::Minus,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::Number("1".into(), false).into(),
+                        )),
+                    }));
+                    // '$[' || (idx - 1) || ']'
+                    let path_expr = Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Value(
+                                sqlparser::ast::Value::SingleQuotedString("$[".into()).into(),
+                            )),
+                            op: sqlparser::ast::BinaryOperator::StringConcat,
+                            right: Box::new(idx_minus_1),
+                        }),
+                        op: sqlparser::ast::BinaryOperator::StringConcat,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::SingleQuotedString("]".into()).into(),
+                        )),
+                    };
+                    *outer_expr = Expr::Function(make_sqlite_function(
+                        "json_extract",
+                        vec![arr_expr, path_expr],
+                    ));
+                    return;
+                }
+            }
+            // Fallback: just recurse into the root
+            for access in access_chain.iter_mut() {
+                match access {
+                    sqlparser::ast::AccessExpr::Dot(e) => strip_pg_ast_expr(e),
+                    sqlparser::ast::AccessExpr::Subscript(sqlparser::ast::Subscript::Index {
+                        index,
+                    }) => strip_pg_ast_expr(index),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pg_stmt_to_sqlite_sql, ConnectionDropWriteContext, TxState};
+    use std::{collections::HashMap, sync::Arc};
+
+    #[test]
+    fn check_normal_pg_dialect_array_subscript() {
+        // Verify the normal PostgreSqlDialect parses s[i] as
+        // CompoundFieldAccess and our walker transforms it to json_extract
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT s[i] FROM t",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        assert!(
+            converted.contains("json_extract(s,"),
+            "expected json_extract in: {converted}"
+        );
+    }
+
+    #[test]
+    fn strip_pg_casts_via_ast() {
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT reltuples::int8 FROM pg_class",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        // The ::int8 cast should be converted to CAST(reltuples AS BIGINT)
+        // (INT8 is a PG alias for BIGINT; SQLite + name_to_type understand BIGINT)
+        assert!(!converted.contains("::"));
+        assert!(converted.contains("CAST(reltuples AS BIGINT)"));
+    }
+
+    #[test]
+    fn strip_pg_catalog_function_prefix_via_ast() {
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT pg_catalog.col_description(16395, ordinal_position) FROM t",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        assert!(!converted.contains("pg_catalog.col_description"));
+        assert!(converted.contains("col_description"));
+    }
+
+    #[test]
+    fn pg_catalog_table_reference_preserved() {
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT * FROM pg_catalog.pg_class",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        // Table references should keep pg_catalog. prefix since SQLite supports schema.table
+        assert!(converted.contains("pg_catalog.pg_class"));
+    }
+
+    #[test]
+    fn connection_drop_context_holds_write_permit_until_owner_drops() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let bookie = corro_types::bookie::Bookie::new(HashMap::new());
+        let bookie_write = bookie.write_lock_blocking();
+        let mut tx_state = TxState::explicit();
+        tx_state.set_write_context(permit, bookie_write);
+
+        let connection_owner = ConnectionDropWriteContext::default();
+        let session_owner = connection_owner.clone();
+        session_owner.hold(&mut tx_state);
+        drop(session_owner);
+
+        assert!(tx_state.is_ended());
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        drop(connection_owner);
+
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+}
+
+#[derive(Default)]
 enum TxState {
     Started {
         kind: OpenTxKind,
+        permits: Option<(OwnedSemaphorePermit, BookieWriteGuard)>,
         writing: bool,
-        failed: bool,
-        write_permit: Option<OwnedSemaphorePermit>,
         ts: Option<Timestamp>,
         schema_version: Option<i64>,
+        failed: bool,
     },
     #[default]
     Ended,
@@ -373,22 +1400,21 @@ impl TxState {
     fn implicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Implicit,
+            permits: None,
             writing: false,
-            failed: false,
-            write_permit: None,
             ts: None,
             schema_version: None,
+            failed: false,
         }
     }
-
     fn explicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Explicit,
+            permits: None,
             writing: false,
-            failed: false,
-            write_permit: None,
             ts: None,
             schema_version: None,
+            failed: false,
         }
     }
 
@@ -400,20 +1426,10 @@ impl TxState {
         matches!(
             self,
             TxState::Started {
-                write_permit: Some(_),
+                permits: Some(_),
                 ..
             }
         )
-    }
-
-    fn is_failed(&self) -> bool {
-        matches!(self, TxState::Started { failed: true, .. })
-    }
-
-    fn mark_failed(&mut self) {
-        if let TxState::Started { failed, .. } = self {
-            *failed = true;
-        }
     }
 
     fn mark_writing(&mut self, ts: Timestamp, schema_version: i64) {
@@ -434,18 +1450,6 @@ impl TxState {
         }
     }
 
-    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
-        if let TxState::Started { write_permit, .. } = self {
-            *write_permit = Some(permit);
-        }
-    }
-
-    fn release_write_permit(&mut self) {
-        if let TxState::Started { write_permit, .. } = self {
-            *write_permit = None;
-        }
-    }
-
     fn timestamp(&self) -> Option<Timestamp> {
         match self {
             TxState::Started { ts, .. } => *ts,
@@ -460,6 +1464,24 @@ impl TxState {
         }
     }
 
+    fn mark_failed(&mut self) {
+        self.fail_explicit();
+    }
+
+    fn set_write_context(&mut self, permit: OwnedSemaphorePermit, bookie_write: BookieWriteGuard) {
+        match self {
+            TxState::Started {
+                permits, writing, ..
+            } => {
+                *writing = true;
+                *permits = Some((permit, bookie_write));
+            }
+            TxState::Ended => {
+                // do nothing, maybe bomb?
+            }
+        }
+    }
+
     fn is_implicit(&self) -> bool {
         matches!(
             self,
@@ -469,7 +1491,6 @@ impl TxState {
             }
         )
     }
-
     fn is_explicit(&self) -> bool {
         matches!(
             self,
@@ -479,9 +1500,30 @@ impl TxState {
             }
         )
     }
-
     fn is_ended(&self) -> bool {
         matches!(self, TxState::Ended)
+    }
+
+    fn is_failed(&self) -> bool {
+        matches!(
+            self,
+            TxState::Started {
+                kind: OpenTxKind::Explicit,
+                failed: true,
+                ..
+            }
+        )
+    }
+
+    fn fail_explicit(&mut self) {
+        if let TxState::Started {
+            kind: OpenTxKind::Explicit,
+            failed,
+            ..
+        } = self
+        {
+            *failed = true;
+        }
     }
 
     fn start_implicit(&mut self) {
@@ -492,52 +1534,39 @@ impl TxState {
         *self = Self::explicit()
     }
 
-    fn end(&mut self) -> Option<OwnedSemaphorePermit> {
-        let permit = match self {
-            TxState::Started { write_permit, .. } => write_permit.take(),
+    fn take_write_context(&mut self) -> Option<(OwnedSemaphorePermit, BookieWriteGuard)> {
+        match self {
+            TxState::Started { permits, .. } => permits.take(),
             TxState::Ended => None,
-        };
+        }
+    }
 
+    fn restore_write_context(
+        &mut self,
+        write_context: Option<(OwnedSemaphorePermit, BookieWriteGuard)>,
+    ) {
+        if let TxState::Started { permits, .. } = self {
+            debug_assert!(permits.is_none());
+            *permits = write_context;
+        }
+    }
+
+    fn end(&mut self) -> Option<(OwnedSemaphorePermit, BookieWriteGuard)> {
+        let permits = self.take_write_context();
         *self = TxState::Ended;
-        permit
+        permits
     }
 }
 
 #[derive(Clone, Default)]
-struct ConnectionDropWritePermit(Rc<RefCell<Option<OwnedSemaphorePermit>>>);
+struct ConnectionDropWriteContext(Rc<RefCell<Option<(OwnedSemaphorePermit, BookieWriteGuard)>>>);
 
-impl ConnectionDropWritePermit {
+impl ConnectionDropWriteContext {
     fn hold(&self, tx_state: &mut TxState) {
-        let permit = tx_state.end();
+        let write_context = tx_state.end();
         let mut held = self.0.borrow_mut();
         debug_assert!(held.is_none());
-        *held = permit;
-    }
-}
-
-#[cfg(test)]
-mod connection_drop_tests {
-    use super::{ConnectionDropWritePermit, TxState};
-    use std::sync::Arc;
-
-    #[test]
-    fn write_permit_is_held_until_connection_owner_drops() {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = semaphore.clone().try_acquire_owned().unwrap();
-        let mut tx_state = TxState::explicit();
-        tx_state.set_write_permit(permit);
-
-        let connection_owner = ConnectionDropWritePermit::default();
-        let session_owner = connection_owner.clone();
-        session_owner.hold(&mut tx_state);
-        drop(session_owner);
-
-        assert!(tx_state.is_ended());
-        assert!(semaphore.clone().try_acquire_owned().is_err());
-
-        drop(connection_owner);
-
-        assert!(semaphore.try_acquire_owned().is_ok());
+        *held = write_context;
     }
 }
 
@@ -699,7 +1728,7 @@ pub async fn start(
 
                 let mut tcp_socket = Framed::new(
                     tokio::io::BufStream::new(conn),
-                    PgWireMessageServerCodec::new(codec::Client::new(local_addr, false)),
+                    PgWireMessageServerCodec::<()>::new(DefaultClient::new(local_addr, false)),
                 );
 
                 let negotiation =
@@ -727,7 +1756,9 @@ pub async fn start(
 
                         let framed = Framed::new(
                             tokio::io::BufStream::new(tls_socket),
-                            PgWireMessageServerCodec::new(codec::Client::new(local_addr, true)),
+                            PgWireMessageServerCodec::new(DefaultClient::<()>::new(
+                                local_addr, true,
+                            )),
                         );
 
                         (Either::Right(framed), true, None)
@@ -958,7 +1989,8 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
-                        let connection_drop_write_permit = ConnectionDropWritePermit::default();
+                        let connection_drop_write_context =
+                            ConnectionDropWriteContext::default();
                         let conn = if readonly {
                             agent.pool().client_dedicated_readonly().unwrap()
                         } else {
@@ -972,9 +2004,69 @@ pub async fn start(
                             int_handle.interrupt();
                         });
 
-                        conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
+                        conn.execute_batch(
+                            "ATTACH ':memory:' AS pg_catalog;
+                             ATTACH ':memory:' AS information_schema;",
+                        )?;
 
                         let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
+                        let table_names = load_information_schema_table_names(&conn)?;
+                        let columns = Arc::new(load_information_schema_columns(&conn, &table_names)?);
+                        let table_constraints = Arc::new(
+                            load_information_schema_table_constraints(columns.as_slice()),
+                        );
+                        let key_column_usage = Arc::new(
+                            load_information_schema_key_column_usage(columns.as_slice()),
+                        );
+                        let pg_class_entries_vec = load_pg_class_entries(&conn, &table_names)?;
+
+                        // Build OID maps for pg_index loading.
+                        let table_oid_map: std::collections::HashMap<String, i64> =
+                            pg_class_entries_vec
+                                .iter()
+                                .filter(|e| e.relkind == "r")
+                                .map(|e| (e.relname.clone(), e.oid))
+                                .collect();
+                        let index_oid_map: std::collections::HashMap<String, i64> =
+                            pg_class_entries_vec
+                                .iter()
+                                .filter(|e| e.relkind == "i")
+                                .map(|e| (e.relname.clone(), e.oid))
+                                .collect();
+                        let pg_index_entries = Arc::new(load_pg_index_entries(
+                            &conn,
+                            &table_oid_map,
+                            &index_oid_map,
+                        )?);
+
+                        // Populate a temp table mapping pg_class OIDs to
+                        // relnames, so pg_get_indexdef can look up index SQL
+                        // by OID.
+                        conn.execute(
+                            "CREATE TEMP TABLE temp_pg_class_oid_map (oid INTEGER, relname TEXT, relkind TEXT)",
+                            [],
+                        )?;
+                        {
+                            let mut stmt = conn.prepare(
+                                "INSERT INTO temp_pg_class_oid_map (oid, relname, relkind) VALUES (?1, ?2, ?3)",
+                            )?;
+                            for entry in pg_class_entries_vec.iter() {
+                                stmt.execute(rusqlite::params![
+                                    entry.oid,
+                                    &entry.relname,
+                                    entry.relkind
+                                ])?;
+                            }
+                        }
+
+                        let pg_class_entries = Arc::new(pg_class_entries_vec);
+
+                        let pg_attributes = Arc::new(load_pg_attributes(
+                            columns.as_slice(),
+                            pg_class_entries.as_slice(),
+                        ));
+                        let triggers = Arc::new(load_information_schema_triggers(&conn)?);
+                        let table_names = Arc::new(table_names);
 
                         conn.create_module(
                             "pg_database",
@@ -999,7 +2091,171 @@ pub async fn start(
                         conn.create_module(
                             "pg_class",
                             eponymous_only_module::<PgClassTable>(),
+                            Some(pg_class_entries),
+                        )?;
+                        conn.create_module(
+                            "pg_attribute",
+                            eponymous_only_module::<PgAttributeTable>(),
+                            Some(pg_attributes),
+                        )?;
+                        conn.create_module(
+                            "tables",
+                            eponymous_only_module::<InformationSchemaTablesTable>(),
+                            Some(table_names.clone()),
+                        )?;
+                        conn.create_module(
+                            "columns",
+                            eponymous_only_module::<InformationSchemaColumnsTable>(),
+                            Some(columns),
+                        )?;
+                        conn.create_module(
+                            "table_constraints",
+                            eponymous_only_module::<InformationSchemaTableConstraintsTable>(),
+                            Some(table_constraints),
+                        )?;
+                        conn.create_module(
+                            "key_column_usage",
+                            eponymous_only_module::<InformationSchemaKeyColumnUsageTable>(),
+                            Some(key_column_usage),
+                        )?;
+                        conn.create_module(
+                            "triggers",
+                            eponymous_only_module::<InformationSchemaTriggersTable>(),
+                            Some(triggers),
+                        )?;
+
+                        // pg_index — populated from sqlite_master indexes.
+                        conn.create_module(
+                            "pg_index",
+                            eponymous_only_module::<PgIndexTable>(),
+                            Some(pg_index_entries),
+                        )?;
+
+                        // pg_constraint — populated from PK and unique constraints.
+                        let pg_constraint_entries = Arc::new(load_pg_constraint_entries(
+                            &conn,
+                            &table_names,
+                            &table_oid_map,
+                            &index_oid_map,
+                        )?);
+                        conn.create_module(
+                            "pg_constraint",
+                            eponymous_only_module::<PgConstraintTable>(),
+                            Some(pg_constraint_entries.clone()),
+                        )?;
+
+                        // pg_get_constraintdef(oid) – returns the definition
+                        // text of a constraint.
+                        conn.execute(
+                            "CREATE TEMP TABLE IF NOT EXISTS temp_pg_constraint_map (oid INTEGER, consrc TEXT)",
+                            [],
+                        )?;
+                        for entry in pg_constraint_entries.iter() {
+                            conn.execute(
+                                "INSERT INTO temp_pg_constraint_map VALUES (?1, ?2)",
+                                rusqlite::params![entry.oid, entry.consrc],
+                            )?;
+                        }
+                        conn.create_scalar_function(
+                            "pg_get_constraintdef",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                let conn = unsafe { ctx.get_connection()? };
+                                let result: Option<String> = conn
+                                    .query_row(
+                                        "SELECT consrc FROM temp_pg_constraint_map WHERE oid = ?1",
+                                        [oid],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(None);
+                                Ok(result)
+                            },
+                        )?;
+
+                        // pg_am — SQLite only uses btree (OID 403).
+                        conn.create_module(
+                            "pg_am",
+                            eponymous_only_module::<PgAmTable>(),
                             None,
+                        )?;
+                        // pg_proc — populated from pragma_function_list().
+                        let pg_proc_entries = Arc::new(load_pg_proc_entries(&conn)?);
+                        conn.create_module(
+                            "pg_proc",
+                            eponymous_only_module::<PgProcTable>(),
+                            Some(pg_proc_entries),
+                        )?;
+                        // pg_language — static list of languages (internal, c, sql).
+                        let pg_language_entries = Arc::new(load_pg_language_entries());
+                        conn.create_module(
+                            "pg_language",
+                            eponymous_only_module::<PgLanguageTable>(),
+                            Some(pg_language_entries),
+                        )?;
+                        // Empty catalog tables that are referenced in JOINs
+                        // but not yet populated.  Returning empty lets tools
+                        // degrade gracefully.
+                        conn.create_module(
+                            "pg_extension",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_EXTENSION_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_statio_user_tables",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_STATIO_USER_TABLES_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_description",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_DESCRIPTION_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_shdescription",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_SHDESCRIPTION_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_attrdef",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_ATTRDEF_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_trigger",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_TRIGGER_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_depend",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_DEPEND_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_inherits",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_INHERITS_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_available_extensions",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_AVAILABLE_EXTENSIONS_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_conversion",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_CONVERSION_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_opclass",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_OPCLASS_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_opfamily",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_OPFAMILY_DDL),
                         )?;
 
                         conn.create_scalar_function(
@@ -1021,6 +2277,492 @@ pub async fn start(
                             1,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                             |_ctx| Ok(false),
+                        )?;
+
+                        // format_type(oid, typmod) – returns the PostgreSQL
+                        // type name for a given type OID.  This is used by
+                        // TablePlus and other tools when introspecting columns.
+                        conn.create_scalar_function(
+                            "format_type",
+                            2,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                Ok(format_type_oid(oid as u32))
+                            },
+                        )?;
+
+                        // col_description(table_oid, column_number) – returns
+                        // the comment for a column.  We don't store comments
+                        // so always return NULL.
+                        conn.create_scalar_function(
+                            "col_description",
+                            2,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // obj_description(oid, catalog) – returns the comment
+                        // for a database object.  Always return NULL.
+                        conn.create_scalar_function(
+                            "obj_description",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // pg_get_indexdef(index_oid) – returns the CREATE INDEX
+                        // statement for an index.  For explicit indexes, return
+                        // the SQL from sqlite_master.  For auto-indexes
+                        // (sqlite_autoindex_*, sql IS NULL), synthesize a
+                        // CREATE INDEX statement from pragma_index_info.
+                        //
+                        // pg_get_indexdef(index_oid, colno, pretty) – returns
+                        // just the colno-th column name (1-based) of the index.
+                        conn.create_scalar_function(
+                            "pg_get_indexdef",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let n = ctx.len();
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                let conn = unsafe { ctx.get_connection()? };
+
+                                // Look up the index name and table name.
+                                let (index_name, tbl_name): (String, String) = conn
+                                    .query_row(
+                                        "SELECT o.relname, m.tbl_name \
+                                         FROM temp_pg_class_oid_map o \
+                                         JOIN sqlite_master m ON m.name = o.relname \
+                                         WHERE o.oid = ?1 AND m.type = 'index'",
+                                        [oid],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .unwrap_or_default();
+
+                                if index_name.is_empty() {
+                                    return Ok::<Option<String>, rusqlite::Error>(None);
+                                }
+
+                                // Get column names from pragma_index_info.
+                                let mut stmt = conn.prepare(
+                                    "SELECT name FROM pragma_index_info(?1) ORDER BY seqno",
+                                )?;
+                                let cols: Vec<String> = stmt
+                                    .query_map([&index_name], |row| row.get::<_, String>(0))?
+                                    .filter_map(|r| r.ok())
+                                    .collect();
+
+                                // 3-arg form: return the colno-th column name.
+                                if n >= 3 {
+                                    let colno: i64 = ctx.get(1).unwrap_or(0);
+                                    if colno < 1 || colno as usize > cols.len() {
+                                        return Ok(None);
+                                    }
+                                    return Ok(Some(cols[(colno - 1) as usize].clone()));
+                                }
+
+                                // 1-arg form: return full CREATE INDEX statement.
+
+                                // Try to get the explicit CREATE INDEX SQL.
+                                let sql: Option<String> = conn
+                                    .query_row(
+                                        "SELECT sql FROM sqlite_master WHERE name = ?1 AND type = 'index'",
+                                        [&index_name],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(None);
+
+                                if let Some(s) = sql {
+                                    return Ok(Some(s));
+                                }
+
+                                if cols.is_empty() {
+                                    return Ok(None);
+                                }
+
+                                // Auto-index: synthesize from pragma_index_info.
+                                // Check if it's unique via pragma_index_list.
+                                let is_unique: bool = conn
+                                    .query_row(
+                                        "SELECT \"unique\" FROM pragma_index_list(?1) WHERE name = ?2",
+                                        rusqlite::params![&tbl_name, &index_name],
+                                        |row| row.get::<_, i64>(0),
+                                    )
+                                    .map(|v| v != 0)
+                                    .unwrap_or(false);
+
+                                let unique_kw = if is_unique { "UNIQUE " } else { "" };
+                                let cols_str = cols.join(", ");
+                                Ok(Some(format!(
+                                    "CREATE {unique_kw}INDEX {index_name} ON {tbl_name} ({cols_str})"
+                                )))
+                            },
+                        )?;
+
+                        // pg_get_function_identity_arguments(oid) – returns
+                        // the argument list of a function as a string.
+                        // We look up the function in pg_proc and return a
+                        // comma-separated list of argument type names.
+                        conn.create_scalar_function(
+                            "pg_get_function_identity_arguments",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                let conn = unsafe { ctx.get_connection()? };
+                                let nargs: i64 = conn
+                                    .query_row(
+                                        "SELECT pronargs FROM pg_proc WHERE oid = ?1",
+                                        [oid],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(0);
+                                if nargs == 0 {
+                                    return Ok::<String, rusqlite::Error>(String::new());
+                                }
+                                // Return placeholder argument types
+                                Ok((0..nargs)
+                                    .map(|_| "anyelement")
+                                    .collect::<Vec<_>>()
+                                    .join(", "))
+                            },
+                        )?;
+
+                        // pg_get_userbyid(oid) – returns the username for a
+                        // role OID.  We always return "postgres" (OID 10).
+                        conn.create_scalar_function(
+                            "pg_get_userbyid",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<String, rusqlite::Error>("postgres".to_string()),
+                        )?;
+
+                        // pg_get_functiondef(oid) – returns the CREATE FUNCTION
+                        // statement for a function.  We synthesize a basic one.
+                        conn.create_scalar_function(
+                            "pg_get_functiondef",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                let conn = unsafe { ctx.get_connection()? };
+                                let (proname, nargs): (String, i64) = conn
+                                    .query_row(
+                                        "SELECT proname, pronargs FROM pg_proc WHERE oid = ?1",
+                                        [oid],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .unwrap_or_default();
+                                if proname.is_empty() {
+                                    return Ok::<Option<String>, rusqlite::Error>(None);
+                                }
+                                let args = if nargs > 0 {
+                                    (0..nargs)
+                                        .map(|i| format!("arg{i}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                } else {
+                                    String::new()
+                                };
+                                Ok(Some(format!(
+                                    "CREATE OR REPLACE FUNCTION {proname}({args}) RETURNS text LANGUAGE sql AS $$ SELECT NULL $$"
+                                )))
+                            },
+                        )?;
+
+                        // pg_get_expr(pg_node_tree, relation_oid) – returns
+                        // the expression text.  We don't have pg_node_tree,
+                        // so return NULL (no partial index expressions).
+                        conn.create_scalar_function(
+                            "pg_get_expr",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // pg_get_partkeydef(oid) – returns the partition key
+                        // expression for a partitioned table.  We don't support
+                        // partitioning, so return NULL.
+                        conn.create_scalar_function(
+                            "pg_get_partkeydef",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // array_to_string(array, delimiter[, null_string])
+                        // – joins array elements with delimiter.  Our arrays
+                        // are PG-style text like "{a,b,c}".  Return empty
+                        // string for NULL arrays.
+                        conn.create_scalar_function(
+                            "array_to_string",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let n = ctx.len();
+                                if n < 2 {
+                                    return Ok::<String, rusqlite::Error>(String::new());
+                                }
+                                let arr: Option<String> = ctx.get(0).unwrap_or(None);
+                                let delimiter: String = ctx.get(1).unwrap_or_default();
+                                let arr = match arr {
+                                    Some(a) => a,
+                                    None => return Ok(String::new()),
+                                };
+                                // Parse PG array literal "{elem1,elem2,...}"
+                                let inner = arr
+                                    .strip_prefix('{')
+                                    .and_then(|s| s.strip_suffix('}'))
+                                    .unwrap_or(&arr);
+                                let parts: Vec<&str> = if inner.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    inner.split(',').collect()
+                                };
+                                Ok(parts.join(&delimiter))
+                            },
+                        )?;
+
+                        // string_agg(value, delimiter) – aggregate that
+                        // concatenates values with a delimiter.  SQLite has
+                        // group_concat which is similar, but TablePlus calls
+                        // string_agg directly.
+                        conn.create_aggregate_function(
+                            "string_agg",
+                            2,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            StringAgg,
+                        )?;
+
+                        // pg_total_relation_size(oid) / pg_table_size(oid) /
+                        // pg_indexes_size(oid) – return the on-disk size of a
+                        // table.  Return 0 as an approximation.
+                        for name in ["pg_total_relation_size", "pg_table_size", "pg_indexes_size"] {
+                            conn.create_scalar_function(
+                                name,
+                                -1,
+                                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                                |_ctx| Ok(0i64),
+                            )?;
+                        }
+
+                        // pg_relation_size(oid) – return the on-disk size
+                        // of a single relation.  Return NULL (DBeaver expects
+                        // bigint, and NULL is type-agnostic).
+                        conn.create_scalar_function(
+                            "pg_relation_size",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<i64>, rusqlite::Error>(None),
+                        )?;
+
+                        // pg_stat_get_numscans(oid) – return the number of
+                        // sequential scans on a relation.  Return NULL.
+                        conn.create_scalar_function(
+                            "pg_stat_get_numscans",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<i64>, rusqlite::Error>(None),
+                        )?;
+
+                        // regexp_replace(source, pattern, replacement[, flags])
+                        // – PostgreSQL regex replace function used by TablePlus
+                        // to extract column names from index definitions.
+                        // Implemented using the `regex` crate with POSIX-style
+                        // patterns (greedy by default, like PostgreSQL).
+                        conn.create_scalar_function(
+                            "regexp_replace",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let n = ctx.len();
+                                if n < 3 {
+                                    return Ok::<String, rusqlite::Error>(String::new());
+                                }
+                                let source: String = ctx.get(0).unwrap_or_default();
+                                let pattern: String = ctx.get(1).unwrap_or_default();
+                                let replacement: String = ctx.get(2).unwrap_or_default();
+                                // Optional 4th arg: flags ('g' for global, 'i' for case-insensitive)
+                                let flags: String = if n >= 4 {
+                                    ctx.get(3).unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                let global = flags.contains('g');
+                                let case_insensitive = flags.contains('i');
+
+                                // Build the regex.  PostgreSQL uses POSIX
+                                // extended regex; the `regex` crate is close
+                                // enough for the patterns TablePlus uses.
+                                let mut builder = regex::RegexBuilder::new(&pattern);
+                                builder.case_insensitive(case_insensitive);
+                                // PostgreSQL defaults to greedy matching.
+                                builder.swap_greed(false);
+
+                                let Ok(re) = builder.build() else {
+                                    // If the pattern is invalid, return the source unchanged.
+                                    return Ok(source);
+                                };
+
+                                // PostgreSQL uses \1, \2, etc. for backreferences
+                                // in the replacement string.  The `regex` crate
+                                // uses $1, $2.  Convert PG-style backrefs.
+                                let repl = convert_pg_backrefs(&replacement);
+
+                                if global {
+                                    Ok(re.replace_all(&source, repl.as_str()).into_owned())
+                                } else {
+                                    Ok(re.replace(&source, repl.as_str()).into_owned())
+                                }
+                            },
+                        )?;
+
+                        // current_setting(name) – returns the current value
+                        // of a PostgreSQL configuration parameter.  We stub
+                        // the few settings that Grafana and other tools query.
+                        conn.create_scalar_function(
+                            "current_setting",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let name: String = ctx.get(0).unwrap_or_default();
+                                let val = match name.as_str() {
+                                    "server_version_num" => "140000".to_string(),
+                                    "server_version" => "14.0.0".to_string(),
+                                    "search_path" => "main".to_string(),
+                                    "standard_conforming_strings" => "on".to_string(),
+                                    "TimeZone" => "UTC".to_string(),
+                                    "integer_datetimes" => "on".to_string(),
+                                    "client_encoding" => "UTF8".to_string(),
+                                    "application_name" => String::new(),
+                                    _ => String::new(),
+                                };
+                                Ok(val)
+                            },
+                        )?;
+
+                        // quote_ident(str) – quotes an identifier if it would
+                        // need quoting in PostgreSQL (contains special chars,
+                        // is a reserved word, etc.).  We wrap in double quotes
+                        // when needed; otherwise return as-is.
+                        conn.create_scalar_function(
+                            "quote_ident",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let s: String = ctx.get(0).unwrap_or_default();
+                                let needs_quoting = s.is_empty()
+                                    || s.chars().any(|c| {
+                                        !c.is_ascii_alphanumeric() && c != '_'
+                                    })
+                                    || s.chars().next().is_none_or(|c| c.is_ascii_digit())
+                                    || is_sqlite_keyword(&s);
+                                if needs_quoting {
+                                    // Escape any embedded double quotes
+                                    let escaped = s.replace('"', "\"\"");
+                                    Ok(format!("\"{escaped}\""))
+                                } else {
+                                    Ok(s)
+                                }
+                            },
+                        )?;
+
+                        // string_to_array(str, delimiter) – splits a string
+                        // by delimiter and returns a JSON array string (since
+                        // SQLite has no native array type).  PG arrays are
+                        // represented as JSON arrays throughout our emulation.
+                        conn.create_scalar_function(
+                            "string_to_array",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let s: String = ctx.get(0).unwrap_or_default();
+                                let delim: String = ctx.get(1).unwrap_or_default();
+                                if delim.is_empty() {
+                                    // PG: empty delimiter splits into characters
+                                    let chars: Vec<String> =
+                                        s.chars().map(|c| c.to_string()).collect();
+                                    return Ok(json_array(&chars));
+                                }
+                                let parts: Vec<String> = s.split(&delim).map(String::from).collect();
+                                Ok(json_array(&parts))
+                            },
+                        )?;
+
+                        // array_length(arr, dim) – returns the length of an
+                        // array dimension.  We delegate to SQLite's builtin
+                        // json_array_length since we represent PG arrays as
+                        // JSON arrays.  dim is ignored (always 1).
+                        conn.create_scalar_function(
+                            "array_length",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let arr: String = ctx.get(0).unwrap_or_default();
+                                let json_arr = if arr.starts_with('[') {
+                                    arr
+                                } else {
+                                    pg_array_to_json(&arr)
+                                };
+                                let conn = unsafe { ctx.get_connection()? };
+                                let n: i64 = conn
+                                    .query_row(
+                                        "SELECT json_array_length(?1)",
+                                        [&json_arr],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(0);
+                                Ok(n)
+                            },
+                        )?;
+
+                        // array_lower(arr, dim) – returns the lower bound of
+                        // an array dimension.  PG arrays are 1-indexed.
+                        conn.create_scalar_function(
+                            "array_lower",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(1i64),
+                        )?;
+
+                        // array_upper(arr, dim) – returns the upper bound of
+                        // an array dimension.  Same as array_length for 1-indexed.
+                        conn.create_scalar_function(
+                            "array_upper",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let arr: String = ctx.get(0).unwrap_or_default();
+                                let json_arr = if arr.starts_with('[') {
+                                    arr
+                                } else {
+                                    pg_array_to_json(&arr)
+                                };
+                                let conn = unsafe { ctx.get_connection()? };
+                                let n: i64 = conn
+                                    .query_row(
+                                        "SELECT json_array_length(?1)",
+                                        [&json_arr],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(0);
+                                Ok(n)
+                            },
+                        )?;
+
+                        // parse_ident(str) – parses a possibly-qualified
+                        // identifier (e.g. "schema"."table") into an array.
+                        // Returns a JSON array of the identifier parts.
+                        conn.create_scalar_function(
+                            "parse_ident",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let s: String = ctx.get(0).unwrap_or_default();
+                                let parts = parse_pg_ident(&s);
+                                Ok(json_array(&parts))
+                            },
                         )?;
 
                         let schema = match compute_schema(&conn) {
@@ -1049,7 +2791,7 @@ pub async fn start(
                             agent,
                             conn: &conn,
                             tx_state: TxState::default(),
-                            connection_drop_write_permit: connection_drop_write_permit.clone(),
+                            connection_drop_write_context: connection_drop_write_context.clone(),
                         };
 
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
@@ -1092,7 +2834,8 @@ pub async fn start(
                                 }
                                 PgWireFrontendMessage::Parse(parse) => {
                                     let name: &str = parse.name.as_deref().unwrap_or_default();
-                                    let mut cmds = match parse_query(&parse.query) {
+                                    tracing::info!(target: "TOOL_DEBUG", query = %parse.query, "parse query");
+                                    let (stripped_sql, mut cmds) = match parse_query(&parse.query) {
                                         Ok(cmds) => cmds,
                                         Err(e) => {
                                             back_tx.blocking_send(
@@ -1143,7 +2886,17 @@ pub async fn start(
 
                                             trace!("parsed cmd: {parsed_cmd:#?}");
 
-                                            let prepped = match session.conn.prepare(&parse.query) {
+                                            let sql_to_prepare = if parsed_cmd.is_rollback() {
+                                                "ROLLBACK"
+                                            } else if parsed_cmd.is_commit() {
+                                                "COMMIT"
+                                            } else if parsed_cmd.is_begin() {
+                                                "BEGIN"
+                                            } else {
+                                                &stripped_sql
+                                            };
+
+                                            let prepped = match session.conn.prepare(sql_to_prepare) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -1175,21 +2928,12 @@ pub async fn start(
                                             debug!("prepped parameter count: {}", prepped.parameter_count());
 
                                             if param_types.len() != prepped.parameter_count() {
-                                                let extracted_types =
-                                                    match parameter_types(&schema, &parsed_cmd) {
-                                                        Ok(extracted_types) => extracted_types,
-                                                        Err(e) => {
-                                                            back_tx.blocking_send(
-                                                                BackendResponse::Message {
-                                                                    message: e.into(),
-                                                                    flush: true,
-                                                                },
-                                                            )?;
-                                                            discard_until_sync = true;
-                                                            continue;
-                                                        }
-                                                    };
-                                                param_types = extracted_types.params
+                                                let extracted_types = parameter_types(&schema, &parsed_cmd);
+
+
+                                                param_types = match extracted_types {
+                                                    Ok(extracted_types) => {
+                                                        extracted_types.params
                                                     .into_iter()
                                                     .map(|param| {
                                                         trace!("got param: {param:?}");
@@ -1198,6 +2942,7 @@ pub async fn start(
                                                             (SqliteType::Null, Some("INT[]")) => Type::INT8_ARRAY,
                                                             (SqliteType::Null, Some("REAL[]")) => Type::FLOAT8_ARRAY,
                                                             (SqliteType::Null, Some("BLOB[]")) => Type::BYTEA_ARRAY,
+                                                            (SqliteType::Null, Some("BOOL[]")) => Type::BOOL_ARRAY,
                                                             (SqliteType::Null, _) => unreachable!(),
                                                             (SqliteType::Text, src) => match src {
                                                                 Some("JSON") => Type::JSON,
@@ -1227,7 +2972,17 @@ pub async fn start(
                                                             },
                                                         }
                                                     })
-                                                    .collect();
+                                                    .collect()
+                                                    }
+                                                    Err(e) => {
+                                                        back_tx.blocking_send(BackendResponse::Message {
+                                                            message: e.into(),
+                                                            flush: true,
+                                                        })?;
+                                                        discard_until_sync = true;
+                                                        continue;
+                                                    }
+                                                };
                                             }
 
                                             let fields = match field_types(
@@ -1247,7 +3002,7 @@ pub async fn start(
                                             prepared.insert(
                                                 name.into(),
                                                 Prepared::NonEmpty {
-                                                    sql: parse.query.clone(),
+                                                    sql: sql_to_prepare.to_string(),
                                                     param_types,
                                                     fields,
                                                     cmd: Box::new(parsed_cmd),
@@ -1383,7 +3138,6 @@ pub async fn start(
                                                             )
                                                                 .into(),
                                                         )?;
-                                                        discard_until_sync = true;
                                                         continue 'outer;
                                                     }
                                                 };
@@ -1468,7 +3222,16 @@ pub async fn start(
                                             cmd,
                                             ..
                                         }) => {
-                                            let mut prepped = match session.conn.prepare(sql) {
+                                            let sql_to_prepare = if cmd.is_rollback() {
+                                                "ROLLBACK"
+                                            } else if cmd.is_commit() {
+                                                "COMMIT"
+                                            } else if cmd.is_begin() {
+                                                "BEGIN"
+                                            } else {
+                                                sql
+                                            };
+                                            let mut prepped = match session.conn.prepare(sql_to_prepare) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -1773,6 +3536,18 @@ pub async fn start(
                                                                     idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
                                                                 )?;
                                                             }
+                                                            t @ &Type::BOOL_ARRAY => {
+                                                                let value: Vec<bool> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
                                                         t => {
                                                             warn!("unsupported type: {t:?}");
                                                             back_tx.blocking_send(
@@ -1901,10 +3676,10 @@ pub async fn start(
                                     }
                                 }
                                 PgWireFrontendMessage::Query(query) => {
-                                    let parsed_query = match parse_query(&query.query) {
+                                    tracing::info!(target: "TOOL_DEBUG", query = %query.query, "simple query");
+                                    let (_stripped_sql, parsed_query) = match parse_query(&query.query) {
                                         Ok(q) => q,
                                         Err(e) => {
-                                            session.tx_state.mark_failed();
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -1921,7 +3696,7 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                discard_until_sync,
+                                                true,
                                                 &back_tx,
                                             )?;
                                             continue;
@@ -1957,7 +3732,7 @@ pub async fn start(
                                             })?;
                                             send_ready(
                                                 &mut session,
-                                                discard_until_sync,
+                                                true,
                                                 &back_tx,
                                             )?;
                                             continue 'outer;
@@ -1967,12 +3742,8 @@ pub async fn start(
                                     // automatically commit an implicit tx
                                     if session.tx_state.is_implicit() {
                                         trace!("committing IMPLICIT tx");
-                                        let failed = session.tx_state.is_failed();
 
-                                        if failed {
-                                            session.rollback_sqlite_tx()?;
-                                            let _permit = session.tx_state.end();
-                                        } else if let Err(e) = session.commit_tx() {
+                                        if let Err(e) = session.commit_tx() {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -1987,11 +3758,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            send_ready(
-                                                &mut session,
-                                                discard_until_sync,
-                                                &back_tx,
-                                            )?;
+                                            send_ready(&mut session, true, &back_tx)?;
                                             continue;
                                         }
                                         trace!("committed IMPLICIT tx");
@@ -2146,22 +3913,16 @@ pub async fn start(
                                             .into(),
                                     )?;
                                     continue;
-                                }
-                                PgWireFrontendMessage::GssEncRequest(_) => {
-                                    back_tx.blocking_send(
-                                        (
-                                            PgWireBackendMessage::GssEncResponse(pgwire::messages::response::GssEncResponse::Refuse), false
-                                        ).into())?;
-                                    continue;
-                                }
-                                PgWireFrontendMessage::SslRequest(_) => {
+                                },
+                                PgWireFrontendMessage::SslNegotiation(_) => {
+                                    // SSL Negotiation should be sent as first message on a new connection.
                                     back_tx.blocking_send(
                                         (
                                             PgWireBackendMessage::ErrorResponse(
                                                 ErrorInfo::new(
                                                     "ERROR".into(),
                                                     "XX000".to_owned(),
-                                                    "SslRequest is not implemented".into(),
+                                                    "Unexpected SSL Negotiation message".into(),
                                                 )
                                                 .into(),
                                             ),
@@ -2170,7 +3931,11 @@ pub async fn start(
                                             .into(),
                                     )?;
                                     continue;
-                                }
+
+                                },
+                                PgWireFrontendMessage::PortalSuspended(_) => {
+                                    // this shouldn't happen, backend sends this msg.
+                                },
                             }
                         }
 
@@ -2263,7 +4028,7 @@ struct Session<'conn> {
     agent: Agent,
     conn: &'conn CrConn,
     tx_state: TxState,
-    connection_drop_write_permit: ConnectionDropWritePermit,
+    connection_drop_write_context: ConnectionDropWriteContext,
 }
 
 impl<'conn> Session<'conn> {
@@ -2297,9 +4062,16 @@ impl<'conn> Session<'conn> {
             return Ok(false);
         }
 
+        // The server's catalog maps do not participate in application writes.
+        // A temporary object shadowing the target still requires canonical SQL.
         self.conn.query_row(
-            "SELECT NOT EXISTS (SELECT 1 FROM sqlite_temp_schema LIMIT 1)",
-            (),
+            "SELECT NOT EXISTS (
+                SELECT 1 FROM sqlite_temp_schema
+                WHERE name = ? COLLATE NOCASE
+                   OR NOT (type = 'table' AND name IN
+                       ('temp_pg_class_oid_map', 'temp_pg_constraint_map'))
+            )",
+            [table],
             |row| row.get(0),
         )
     }
@@ -2352,7 +4124,7 @@ impl<'conn> Session<'conn> {
         };
 
         if self.conn.is_autocommit() {
-            self.tx_state.release_write_permit();
+            drop(self.tx_state.take_write_context());
         }
 
         result
@@ -2381,7 +4153,8 @@ impl<'conn> Session<'conn> {
                 return Err(err.into());
             }
         };
-        self.tx_state.set_write_permit(permit);
+        let bookie_write = self.agent.bookie().write_lock_blocking();
+        self.tx_state.set_write_context(permit, bookie_write);
 
         let result = (|| -> Result<(), QueryError> {
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -2431,19 +4204,6 @@ impl<'conn> Session<'conn> {
     }
 
     fn handle_query(
-        &mut self,
-        cmd: &ParsedCmd,
-        back_tx: &Sender<BackendResponse>,
-        send_row_desc: bool,
-    ) -> Result<(), QueryError> {
-        let result = self.handle_query_inner(cmd, back_tx, send_row_desc);
-        if result.is_err() && !self.tx_state.is_ended() {
-            self.tx_state.mark_failed();
-        }
-        result
-    }
-
-    fn handle_query_inner(
         &mut self,
         cmd: &ParsedCmd,
         back_tx: &Sender<BackendResponse>,
@@ -2500,8 +4260,7 @@ impl<'conn> Session<'conn> {
             self.commit_tx()?;
             0
         } else if cmd.is_rollback() {
-            self.rollback_sqlite_tx()?;
-            let _permit = self.tx_state.end();
+            self.rollback_tx()?;
             0
         } else {
             let mut prepped = if cmd.is_pg() {
@@ -2529,7 +4288,6 @@ impl<'conn> Session<'conn> {
             let schema = Arc::new(fields);
 
             if !prepped.readonly() {
-                trace!("query statement writes");
                 self.prepare_write(cmd)?;
             }
 
@@ -2560,7 +4318,7 @@ impl<'conn> Session<'conn> {
                         }
                     }
                 }
-                let data_row = encoder.finish()?;
+                let data_row = encoder.take_row();
                 back_tx
                     .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
@@ -2596,22 +4354,6 @@ impl<'conn> Session<'conn> {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_execute(
-        &mut self,
-        prepped: &mut Statement<'conn>,
-        result_formats: &[FieldFormat],
-        cmd: &ParsedCmd,
-        max_rows: usize,
-        back_tx: &Sender<BackendResponse>,
-    ) -> Result<(), QueryError> {
-        let result = self.handle_execute_inner(prepped, result_formats, cmd, max_rows, back_tx);
-        if result.is_err() && !self.tx_state.is_ended() {
-            self.tx_state.mark_failed();
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn handle_execute_inner(
         &mut self,
         prepped: &mut Statement<'conn>,
         result_formats: &[FieldFormat],
@@ -2656,14 +4398,11 @@ impl<'conn> Session<'conn> {
         if cmd.is_commit() {
             self.commit_tx()?;
         } else if cmd.is_rollback() {
-            self.rollback_sqlite_tx()?;
-            let _permit = self.tx_state.end();
+            self.rollback_tx()?;
         } else if cmd.is_begin() {
-            // do nothing
             debug!("cmd is BEGIN");
         } else {
             if !prepped.readonly() {
-                trace!("statement writes");
                 self.prepare_write(cmd)?;
             }
             let mut rows = prepped.raw_query();
@@ -2701,6 +4440,7 @@ impl<'conn> Session<'conn> {
                 for (idx, field) in schema.iter().enumerate() {
                     trace!("processing field: {field:?}");
                     let format = field.format();
+                    let format_opts = field.format_options().as_ref();
                     match field.datatype() {
                         &Type::ANY => {
                             let data = row.get_ref_unwrap(idx);
@@ -2710,11 +4450,17 @@ impl<'conn> Session<'conn> {
                                         &None::<i8>,
                                         &Type::ANY,
                                         format,
+                                        format_opts,
                                     )
                                     .unwrap(),
                                 ValueRef::Integer(i) => {
                                     encoder
-                                        .encode_field_with_type_and_format(&i, &Type::INT8, format)
+                                        .encode_field_with_type_and_format(
+                                            &i,
+                                            &Type::INT8,
+                                            format,
+                                            format_opts,
+                                        )
                                         .unwrap();
                                 }
                                 ValueRef::Real(f) => {
@@ -2723,6 +4469,7 @@ impl<'conn> Session<'conn> {
                                             &f,
                                             &Type::FLOAT8,
                                             format,
+                                            format_opts,
                                         )
                                         .unwrap();
                                 }
@@ -2732,15 +4479,31 @@ impl<'conn> Session<'conn> {
                                             &String::from_utf8_lossy(t).as_ref(),
                                             &Type::TEXT,
                                             format,
+                                            format_opts,
                                         )
                                         .unwrap();
                                 }
                                 ValueRef::Blob(b) => {
                                     encoder
-                                        .encode_field_with_type_and_format(&b, &Type::BYTEA, format)
+                                        .encode_field_with_type_and_format(
+                                            &b,
+                                            &Type::BYTEA,
+                                            format,
+                                            format_opts,
+                                        )
                                         .unwrap();
                                 }
                             }
+                        }
+                        t @ &Type::BOOL => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &row.get::<_, Option<bool>>(idx)?,
+                                    t,
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
                         }
                         t @ &Type::INT8 => {
                             encoder
@@ -2748,6 +4511,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<i64>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2757,6 +4521,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<NaiveDateTime>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2766,6 +4531,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<String>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2775,6 +4541,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<Vec<u8>>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2784,6 +4551,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<f64>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2795,7 +4563,7 @@ impl<'conn> Session<'conn> {
                     }
                 }
 
-                let data_row = encoder.finish()?;
+                let data_row = encoder.take_row();
                 back_tx
                     .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
@@ -2828,9 +4596,44 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
+    fn commit_tx(&mut self) -> Result<(), ChangeError> {
+        let write_context = self.tx_state.take_write_context();
+        let speculative = self.tx_state.is_writing() && write_context.is_none();
+        let result = match write_context.as_ref() {
+            Some((_permit, bookie_write)) => self.handle_commit(bookie_write),
+            None if speculative => self.handle_speculative_commit(),
+            None => self.commit_db(),
+        };
+
+        // A speculative commit rolls back the original connection before replay.
+        // Its autocommit state does not mean an explicit logical transaction
+        // recovered from a failed replay. Require ROLLBACK in that case.
+        if result.is_ok() || (!speculative && self.conn.is_autocommit()) {
+            let _write_context = self.tx_state.end();
+        } else {
+            self.tx_state.restore_write_context(write_context);
+            self.tx_state.fail_explicit();
+        }
+        result
+    }
+
+    fn rollback_tx(&mut self) -> rusqlite::Result<()> {
+        let result = if self.conn.is_autocommit() {
+            Ok(())
+        } else {
+            self.conn.execute_batch("ROLLBACK")
+        };
+
+        if self.conn.is_autocommit() {
+            let _write_context = self.tx_state.end();
+        }
+
+        result
+    }
+
     fn validate_transaction_command(&self, cmd: &ParsedCmd) -> Result<(), QueryError> {
         if self.tx_state.is_failed() && !cmd.is_rollback() {
-            return Err(QueryError::TransactionAborted);
+            return Err(QueryError::InFailedTransaction);
         }
 
         if self.tx_state.is_explicit() && cmd.is_begin() {
@@ -2840,69 +4643,57 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
-    fn commit_tx(&mut self) -> Result<(), ChangeError> {
-        let result = self.handle_commit(self.tx_state.is_canonical());
-
-        if result.is_ok() || self.conn.is_autocommit() {
-            let _permit = self.tx_state.end();
-        } else {
-            self.tx_state.mark_failed();
-        }
-
-        result
+    fn commit_db(&self) -> Result<(), ChangeError> {
+        let actor_id = self.agent.actor_id();
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+        Ok(())
     }
 
-    fn handle_commit(&self, canonical: bool) -> Result<(), ChangeError> {
+    fn handle_commit(&self, bookie_write: &BookieWriteGuard) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
         let actor_id = self.agent.actor_id();
 
-        if canonical {
-            let mut book_writer = self
-                .agent
-                .booked()
-                .blocking_write::<&str, _>("handle_write_tx(booked writer)", None);
+        let mut book_writer = bookie_write.write_tx(self.agent.booked());
 
-            let result = (|| {
-                let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+        let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
 
-                self.conn
-                    .execute_batch("COMMIT")
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(actor_id),
-                        version: insert_info.as_ref().map(|info| info.db_version),
-                    })?;
+        if let Some(InsertChangesInfo {
+            db_version,
+            last_seq,
+            ts,
+        }) = insert_info
+        {
+            trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-                Ok::<_, ChangeError>(insert_info)
-            })();
+            book_writer.commit();
 
-            let insert_info = match result {
-                Ok(insert_info) => insert_info,
-                Err(err) => {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(err);
-                }
-            };
-
-            if let Some(InsertChangesInfo {
-                db_version,
-                last_seq,
-                ts,
-                snap,
-            }) = insert_info
+            // commit_tx retains the write context until extraction is complete.
+            // Do not return a transaction error after COMMIT has succeeded.
+            if let Err(error) = broadcast_changes(&self.agent, self.conn, db_version, last_seq, ts)
             {
-                book_writer.commit_snapshot(snap);
-
-                let agent = self.agent.clone();
-                spawn_counted(
-                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
-                );
+                error!(%db_version, %error, "could not dispatch committed changes");
             }
-
-            return Ok(());
         }
 
+        Ok(())
+    }
+
+    fn handle_speculative_commit(&self) -> Result<(), ChangeError> {
+        let actor_id = self.agent.actor_id();
         let pending = match PendingLocalChanges::capture(self.conn, actor_id) {
             Ok(pending) => pending,
             Err(source) => {
@@ -2930,10 +4721,8 @@ impl<'conn> Session<'conn> {
         let mut conn =
             tokio::runtime::Handle::current().block_on(self.agent.pool().write_priority())?;
 
-        let mut book_writer = self
-            .agent
-            .booked()
-            .blocking_write::<&str, _>("handle_write_tx(booked writer)", None);
+        let bookie_write = self.agent.bookie().write_lock_blocking();
+        let mut book_writer = bookie_write.write_tx(self.agent.booked());
 
         let tx = conn
             .immediate_transaction()
@@ -2975,15 +4764,15 @@ impl<'conn> Session<'conn> {
             db_version,
             last_seq,
             ts,
-            snap,
         }) = insert_info
         {
             trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-            book_writer.commit_snapshot(snap);
+            book_writer.commit();
 
-            let agent = self.agent.clone();
-            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
+            if let Err(error) = broadcast_changes(&self.agent, &conn, db_version, last_seq, ts) {
+                error!(%db_version, %error, "could not dispatch committed changes");
+            }
         }
 
         Ok(())
@@ -3013,12 +4802,11 @@ impl<'conn> Session<'conn> {
 impl<'conn> Drop for Session<'conn> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
-            if let Err(e) = self.rollback_sqlite_tx() {
+            if let Err(e) = self.rollback_tx() {
                 warn!("failed to rollback tx: {e}");
-                self.connection_drop_write_permit.hold(&mut self.tx_state);
+                self.connection_drop_write_context.hold(&mut self.tx_state);
             } else {
                 debug!("rolled back tx");
-                let _permit = self.tx_state.end();
             }
         }
     }
@@ -3029,23 +4817,24 @@ fn send_ready(
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
-    if discard_until_sync && !session.tx_state.is_ended() {
-        session.tx_state.mark_failed();
+    if discard_until_sync {
+        session.tx_state.fail_explicit();
     }
 
     let ready_status = if session.tx_state.is_implicit() {
-        if discard_until_sync || session.tx_state.is_failed() {
+        if discard_until_sync {
+            // an error occurred, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-            session.rollback_sqlite_tx()?;
-            let _permit = session.tx_state.end();
+            session.rollback_tx()?;
         } else {
+            // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
             session.commit_tx()?;
         }
 
         TransactionStatus::Idle
     } else if session.tx_state.is_explicit() {
-        if discard_until_sync || session.tx_state.is_failed() {
+        if session.tx_state.is_failed() {
             TransactionStatus::Error
         } else {
             TransactionStatus::Transaction
@@ -3084,7 +4873,7 @@ enum QueryError {
     #[error(transparent)]
     Change(#[from] ChangeError),
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
-    TransactionAborted,
+    InFailedTransaction,
     #[error("there is already a transaction in progress")]
     ActiveTransaction,
 }
@@ -3120,13 +4909,13 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
             e @ QueryError::PermitAcquire(_) => {
-                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+                ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
             QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
             QueryError::Change(e) => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
-            e @ QueryError::TransactionAborted => ErrorInfo::new(
+            e @ QueryError::InFailedTransaction => ErrorInfo::new(
                 "ERROR".to_owned(),
                 SqlState::IN_FAILED_SQL_TRANSACTION.code().into(),
                 e.to_string(),
@@ -3179,13 +4968,19 @@ fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
     })
 }
 
-fn from_array_type_and_format<'a, T: FromSql<'a> + FromSqlText>(
+fn from_array_type_and_format<'a, T>(
     t: &Type,
     b: &'a [u8],
     format_code: FormatCode,
-) -> Result<Vec<T>, ToParamError<String>> {
+) -> Result<Vec<T>, ToParamError<String>>
+where
+    T: FromSql<'a> + for<'b> FromSqlText<'b>,
+{
+    let format_opts = FormatOptions::default();
     Ok(match format_code {
-        FormatCode::Text => Vec::<T>::from_vec_sql_text(t, b).map_err(ToParamError::FromSql)?,
+        FormatCode::Text => {
+            Vec::<T>::from_vec_sql_text(t, b, &format_opts).map_err(ToParamError::FromSql)?
+        }
         FormatCode::Binary => Vec::<T>::from_sql(t, b).map_err(ToParamError::FromSql)?,
     })
 }
@@ -3207,7 +5002,7 @@ impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
+#[error("Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[] BOOL[] BOOLEAN[]")]
 struct UntypedUnnestParameter;
 
 impl From<UntypedUnnestParameter> for PgWireBackendMessage {
@@ -3224,18 +5019,53 @@ impl From<UntypedUnnestParameter> for ErrorResponse {
 
 #[allow(clippy::result_large_err)]
 fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
-    Ok(match name.to_uppercase().as_ref() {
+    // Strip any type modifiers (e.g., "VARCHAR(255)" -> "VARCHAR") so that
+    // parameterized types map correctly.
+    let base = name.split('(').next().unwrap_or(name).trim().to_uppercase();
+    Ok(match base.as_ref() {
         "ANY" => Type::ANY,
         "INT" | "INTEGER" | "BIGINT" => Type::INT8,
-        "DATETIME" => Type::TIMESTAMP,
-        "VARCHAR" => Type::VARCHAR,
+        "DATETIME" | "TIMESTAMP" => Type::TIMESTAMP,
+        "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" => Type::VARCHAR,
         "TEXT" => Type::TEXT,
         "BINARY" | "BLOB" => Type::BYTEA,
         "JSONB" => Type::JSONB,
         "JSON" => Type::JSON,
-        "FLOAT" => Type::FLOAT8,
+        "FLOAT" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" => Type::FLOAT8,
+        "BOOL" | "BOOLEAN" => Type::BOOL,
+        "NUMERIC" | "DECIMAL" => Type::NUMERIC,
+        "CHAR" | "CHARACTER" => Type::BPCHAR,
+        "CLOB" => Type::TEXT,
+        "DATE" => Type::DATE,
+        "TIME" => Type::TIME,
         _ => return Err(UnsupportedSqliteToPostgresType(name.to_string())),
     })
+}
+
+/// Maps a PostgreSQL type OID to its human-readable type name, matching the
+/// behaviour of PostgreSQL's `format_type()` builtin.  Used by tools like
+/// TablePlus to display column types.
+fn format_type_oid(oid: u32) -> String {
+    match oid {
+        16 => "boolean".into(),
+        17 => "bytea".into(),
+        18 => "character".into(),
+        20 => "bigint".into(),
+        21 => "smallint".into(),
+        23 => "integer".into(),
+        25 => "text".into(),
+        700 => "real".into(),
+        701 => "double precision".into(),
+        1042 => "character".into(),
+        1043 => "character varying".into(),
+        1082 => "date".into(),
+        1083 => "time without time zone".into(),
+        1114 => "timestamp without time zone".into(),
+        114 => "json".into(),
+        3802 => "jsonb".into(),
+        1700 => "numeric".into(),
+        _ => "unknown".into(),
+    }
 }
 
 fn compute_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
@@ -3676,6 +5506,7 @@ fn handle_table_call_params<'schema, 'stmt>(
                         "BLOB" => Some("BLOB[]"),
                         "INT" | "INTEGER" | "BIGINT" => Some("INT[]"),
                         "REAL" | "FLOAT" | "DOUBLE" => Some("REAL[]"),
+                        "BOOL" | "BOOLEAN" => Some("BOOL[]"),
                         _ => None,
                     };
                     if is_array_type {

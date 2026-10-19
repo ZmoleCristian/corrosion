@@ -2,12 +2,12 @@ use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
-use corro_types::config::GossipConfig;
+use corro_types::config::{ClientBinds, GossipConfig};
 use metrics::{counter, gauge, histogram};
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
@@ -27,9 +27,46 @@ pub struct Transport(Arc<TransportInner>);
 
 #[derive(Debug)]
 struct TransportInner {
-    endpoints: Vec<Endpoint>,
+    endpoints: ClientEndpoints,
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
+    path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
+    /// Last `path.latest_rtt` pushed per peer by [`Transport::sample_rtts`],
+    /// used to skip re-pushing a measurement that has not moved.
+    rtt_marks: StdMutex<HashMap<SocketAddr, Duration>>,
+}
+
+#[derive(Debug)]
+enum ClientEndpoints {
+    Single(Vec<Endpoint>),
+    ByFamily {
+        v4: Vec<Endpoint>,
+        v6: Vec<Endpoint>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathSnapshot {
+    cwnd: u64,
+    congestion_events: u64,
+    black_holes_detected: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrafficClass {
+    Sync,
+    Broadcast,
+    Foca,
+}
+
+impl TrafficClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Broadcast => "broadcast",
+            Self::Foca => "foca",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +83,11 @@ pub enum TransportError {
     TimedOut(#[from] Elapsed),
     #[error(transparent)]
     Stopped(#[from] quinn::StoppedError),
+    #[error("no {family} client socket bound for destination {addr}")]
+    NoClientSocket {
+        family: &'static str,
+        addr: SocketAddr,
+    },
 }
 
 impl Transport {
@@ -53,45 +95,72 @@ impl Transport {
         config: &GossipConfig,
         rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     ) -> eyre::Result<Self> {
-        let mut endpoints = vec![];
-        let endpoints_count = if config.client_addr.port() == 0 {
-            // zero port means we'll use whatever is available,
-            // corrosion can use multiple sockets and reduce the risk of filling kernel buffers
-            8
-        } else {
-            // non-zero client addr port means we can only use 1
-            1
+        let endpoints = match config.client_binds()? {
+            ClientBinds::Single(addr) => {
+                ClientEndpoints::Single(bind_client_pool(config, addr, "client").await?)
+            }
+            ClientBinds::ByFamily { v4, v6 } => {
+                let v4 = match v4 {
+                    Some(addr) => bind_client_pool(config, addr, "IPv4").await?,
+                    None => Vec::new(),
+                };
+                let v6 = match v6 {
+                    Some(addr) => bind_client_pool(config, addr, "IPv6").await?,
+                    None => Vec::new(),
+                };
+                ClientEndpoints::ByFamily { v4, v6 }
+            }
         };
-        for i in 0..endpoints_count {
-            let ep = gossip_client_endpoint(config).await?;
-            info!(
-                "Transport ({i}) for outgoing connections bound to socket {}",
-                ep.local_addr().unwrap()
-            );
-            endpoints.push(ep);
-        }
         Ok(Self(Arc::new(TransportInner {
             endpoints,
             conns: Default::default(),
             rtt_tx,
+            path_snapshots: Default::default(),
+            rtt_marks: Default::default(),
         })))
+    }
+
+    fn endpoints_for(&self, addr: SocketAddr) -> Result<&[Endpoint], TransportError> {
+        match &self.0.endpoints {
+            ClientEndpoints::Single(endpoints) => Ok(endpoints),
+            ClientEndpoints::ByFamily { v4, v6 } => {
+                let (endpoints, family) = match addr {
+                    SocketAddr::V4(_) => (v4, "IPv4"),
+                    SocketAddr::V6(_) => (v6, "IPv6"),
+                };
+
+                if endpoints.is_empty() {
+                    Err(TransportError::NoClientSocket { family, addr })
+                } else {
+                    Ok(endpoints.as_slice())
+                }
+            }
+        }
     }
 
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Foca).await?;
         trace!("connected to {addr}");
 
         match conn.send_datagram(data.clone()) {
-            Ok(send) => {
+            Ok(()) => {
                 trace!("sent datagram to {addr}");
-                return Ok(send);
             }
             Err(SendDatagramError::ConnectionLost(e)) => {
                 debug!("retryable error attempting to send datagram: {e}");
+
+                let conn = self.connect(addr, TrafficClass::Foca).await?;
+                debug!("re-connected to {addr}");
+                conn.send_datagram(data.clone())?;
             }
             Err(e) => {
-                counter!("corro.transport.send_datagram.errors", "addr" => addr.to_string(), "error" => e.to_string()).increment(1);
+                counter!(
+                    "corro.transport.send_datagram.errors.v2",
+                    "traffic" => TrafficClass::Foca.as_str(),
+                    "kind" => datagram_error_kind(&e)
+                )
+                .increment(1);
                 if matches!(e, SendDatagramError::TooLarge) {
                     warn!(%addr, "attempted to send a larger-than-PMTU datagram. len: {}, pmtu: {:?}", data.len(), conn.max_datagram_size());
                 }
@@ -99,14 +168,24 @@ impl Transport {
             }
         }
 
-        let conn = self.connect(addr).await?;
-        debug!("re-connected to {addr}");
-        Ok(conn.send_datagram(data)?)
+        counter!(
+            "corro.transport.tx.datagrams.v2.total",
+            "traffic" => TrafficClass::Foca.as_str()
+        )
+        .increment(1);
+        counter!(
+            "corro.transport.tx.bytes.v2.total",
+            "traffic" => TrafficClass::Foca.as_str()
+        )
+        .increment(data.len() as u64);
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
-        let conn = self.connect(addr).await?;
+        let len = data.len();
+        let conn = self.connect(addr, TrafficClass::Broadcast).await?;
 
         let mut stream = match conn
             .open_uni()
@@ -119,7 +198,7 @@ impl Transport {
             }
             Err(e) => {
                 debug!("retryable error attempting to open unidirectional stream: {e}");
-                let conn = self.connect(addr).await?;
+                let conn = self.connect(addr, TrafficClass::Broadcast).await?;
                 conn.open_uni()
                     .instrument(debug_span!("quic_open_uni"))
                     .await?
@@ -140,6 +219,12 @@ impl Transport {
             .instrument(debug_span!("quic_stopped"))
             .await?;
 
+        counter!(
+            "corro.transport.tx.bytes.v2.total",
+            "traffic" => TrafficClass::Broadcast.as_str()
+        )
+        .increment(len as u64);
+
         Ok(())
     }
 
@@ -148,7 +233,7 @@ impl Transport {
         &self,
         addr: SocketAddr,
     ) -> Result<(SendStream, RecvStream), TransportError> {
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Sync).await?;
         match conn.open_bi().instrument(debug_span!("quic_open_bi")).await {
             Ok(send_recv) => return Ok(send_recv),
             Err(e @ ConnectionError::VersionMismatch) => {
@@ -160,7 +245,7 @@ impl Transport {
         }
 
         // retry, it should reconnect!
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Sync).await?;
         Ok(conn
             .open_bi()
             .instrument(debug_span!("quic_open_bi"))
@@ -171,35 +256,133 @@ impl Transport {
         &self,
         addr: SocketAddr,
         server_name: String,
+        traffic: TrafficClass,
     ) -> Result<Connection, TransportError> {
         let start = Instant::now();
 
+        let endpoints = match self.endpoints_for(addr) {
+            Ok(endpoints) => endpoints,
+            Err(e) => {
+                counter!(
+                    "corro.transport.connect.errors.v2",
+                    "traffic" => traffic.as_str(),
+                    "kind" => "no_client_socket"
+                )
+                .increment(1);
+                return Err(e);
+            }
+        };
+
         let mut hasher = seahash::SeaHasher::new();
         addr.hash(&mut hasher);
-        let endpoint_idx = (hasher.finish() % self.0.endpoints.len() as u64) as usize;
+        let endpoint_idx = (hasher.finish() % endpoints.len() as u64) as usize;
+        let endpoint = endpoints[endpoint_idx].clone();
 
         async {
-            match tokio::time::timeout(Duration::from_secs(5), self
-                .0
-                .endpoints[endpoint_idx]
-                .connect(addr, &server_name)?)
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                endpoint.connect(addr, &server_name)?,
+            )
+            .await
             {
                 Ok(Ok(conn)) => {
-                    histogram!("corro.transport.connect.time.seconds").record(start.elapsed().as_secs_f64());
+                    histogram!(
+                        "corro.transport.connect.time.v2.seconds",
+                        "traffic" => traffic.as_str()
+                    )
+                    .record(start.elapsed().as_secs_f64());
                     tracing::Span::current().record("rtt", conn.rtt().as_secs_f64());
                     Ok(conn)
-                },
+                }
                 Ok(Err(e)) => {
-                    counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string()).increment(1);
+                    counter!(
+                        "corro.transport.connect.errors.v2",
+                        "traffic" => traffic.as_str(),
+                        "kind" => "connect_error"
+                    )
+                    .increment(1);
                     Err(e.into())
                 }
                 Err(e) => {
-                    counter!("corro.transport.connect.errors", "addr" => server_name, "error" => "timed out").increment(1);
+                    counter!(
+                        "corro.transport.connect.errors.v2",
+                        "traffic" => traffic.as_str(),
+                        "kind" => "timed_out"
+                    )
+                    .increment(1);
                     Err(e.into())
                 }
             }
-        }.instrument(debug_span!("quic_connect", %addr, rtt = tracing::field::Empty)).await
+        }
+        .instrument(debug_span!("quic_connect", %addr, rtt = tracing::field::Empty))
+        .await
+    }
+
+    /// Push an RTT sample for each live cached connection that has a new
+    /// measurement since the last sweep.
+    ///
+    /// `Connection::rtt` is a smoothed cache, so we sample `path.latest_rtt`
+    /// and let the ring's median window absorb the jitter. Repeats of the same
+    /// millisecond are skipped: re-pushing an unchanged value would overweight
+    /// it in that window and stop the ring tracking the current path.
+    pub async fn sample_rtts(&self) {
+        // Arc handles only; the map lock is released before any per-connection
+        // lock is taken.
+        let conns = self.0.conns.read().await.clone();
+
+        let mut marks = self
+            .0
+            .rtt_marks
+            .lock()
+            .expect("rtt marks lock should not be poisoned");
+        marks.retain(|addr, _| conns.contains_key(addr));
+
+        for (addr, conn_lock) in conns {
+            // connect() holds this across the handshake, and a peer that is
+            // reconnecting has an RTT belonging to a connection already on its
+            // way out. Skip it rather than stall the sweep.
+            let rtt = {
+                let Ok(lock) = conn_lock.try_lock() else {
+                    continue;
+                };
+                let Some(conn) = lock.as_ref() else {
+                    continue;
+                };
+
+                if conn.close_reason().is_some() {
+                    continue;
+                }
+
+                let stats = conn.stats();
+                // No ACK yet: the estimate is still INITIAL_RTT, not a measurement.
+                if stats.frame_rx.acks == 0 {
+                    continue;
+                }
+
+                if stats.path.min_rtt.is_zero() {
+                    continue;
+                }
+
+                stats.path.min_rtt
+            };
+
+            let measured = marks
+                .get(&addr)
+                .is_none_or(|prev| prev.as_millis() != rtt.as_millis());
+
+            if !measured {
+                counter!("corro.transport.rtt.samples", "result" => "skipped").increment(1);
+                continue;
+            }
+
+            if let Err(e) = self.0.rtt_tx.try_send((addr, rtt)) {
+                debug!("could not send RTT for connection through sender: {e}");
+                counter!("corro.transport.rtt.samples", "result" => "dropped").increment(1);
+            } else {
+                marks.insert(addr, rtt);
+                counter!("corro.transport.rtt.samples", "result" => "sent").increment(1);
+            }
+        }
     }
 
     // this shouldn't block for long...
@@ -216,16 +399,17 @@ impl Transport {
     }
 
     #[tracing::instrument(skip(self), fields(tid = ?std::thread::current().id()), level = "debug", err)]
-    async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
+    async fn connect(
+        &self,
+        addr: SocketAddr,
+        traffic: TrafficClass,
+    ) -> Result<Connection, TransportError> {
         let conn_lock = self.get_lock(addr).await;
 
         let mut lock = conn_lock.lock().await;
 
         if let Some(conn) = lock.as_ref() {
             if test_conn(conn) {
-                if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
-                    debug!("could not send RTT for connection through sender: {e}");
-                }
                 return Ok(conn.clone());
             }
         }
@@ -233,7 +417,9 @@ impl Transport {
         // clear it, if there was one it didn't pass the test.
         *lock = None;
 
-        let conn = self.measured_connect(addr, addr.ip().to_string()).await?;
+        let conn = self
+            .measured_connect(addr, addr.ip().to_string(), traffic)
+            .await?;
         *lock = Some(conn.clone());
         Ok(conn)
     }
@@ -256,12 +442,39 @@ impl Transport {
         let stats = conns
             .iter()
             .fold(ConnectionStats::default(), |mut acc, (addr, stats)| {
-                gauge!("corro.transport.path.cwnd", "addr" => addr.to_string())
-                    .set(stats.path.cwnd as f64);
-                gauge!("corro.transport.path.congestion_events", "addr" => addr.to_string())
-                    .set(stats.path.congestion_events as f64);
-                gauge!("corro.transport.path.black_holes_detected", "addr" => addr.to_string())
-                    .set(stats.path.black_holes_detected as f64);
+                let current = PathSnapshot {
+                    cwnd: stats.path.cwnd,
+                    congestion_events: stats.path.congestion_events,
+                    black_holes_detected: stats.path.black_holes_detected,
+                };
+                let mut snapshots = self
+                    .0
+                    .path_snapshots
+                    .lock()
+                    .expect("path snapshots lock should not be poisoned");
+                if let Some(previous) = snapshots.get(addr).copied() {
+                    let cwnd_delta = current.cwnd.saturating_sub(previous.cwnd);
+                    let congestion_events_delta = current
+                        .congestion_events
+                        .saturating_sub(previous.congestion_events);
+                    let black_holes_detected_delta = current
+                        .black_holes_detected
+                        .saturating_sub(previous.black_holes_detected);
+
+                    if cwnd_delta > 0
+                        || congestion_events_delta > 0
+                        || black_holes_detected_delta > 0
+                    {
+                        info!(
+                            %addr,
+                            cwnd_delta,
+                            congestion_events_delta,
+                            black_holes_detected_delta,
+                            "transport path metrics increased"
+                        );
+                    }
+                }
+                snapshots.insert(*addr, current);
 
                 acc.path.lost_packets += stats.path.lost_packets;
                 acc.path.lost_bytes += stats.path.lost_bytes;
@@ -325,6 +538,14 @@ impl Transport {
 
                 acc
             });
+        {
+            let mut snapshots = self
+                .0
+                .path_snapshots
+                .lock()
+                .expect("path snapshots lock should not be poisoned");
+            snapshots.retain(|addr, _| conns.iter().any(|(active_addr, _)| active_addr == addr));
+        }
         gauge!("corro.transport.path.lost_packets").set(stats.path.lost_packets as f64);
         gauge!("corro.transport.path.lost_bytes").set(stats.path.lost_bytes as f64);
         gauge!("corro.transport.path.sent_packets").set(stats.path.sent_packets as f64);
@@ -426,6 +647,40 @@ impl Transport {
 }
 
 const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
+
+async fn bind_client_pool(
+    config: &GossipConfig,
+    bind_addr: SocketAddr,
+    label: &str,
+) -> eyre::Result<Vec<Endpoint>> {
+    let count = if bind_addr.port() == 0 {
+        // zero port means we'll use whatever is available,
+        // corrosion can use multiple sockets and reduce the risk of filling kernel buffers
+        8
+    } else {
+        // non-zero client addr port means we can only use 1
+        1
+    };
+    let mut endpoints = Vec::with_capacity(count);
+    for i in 0..count {
+        let ep = gossip_client_endpoint(config, bind_addr).await?;
+        info!(
+            "Transport ({i}) {label} outgoing connections bound to socket {}",
+            ep.local_addr().unwrap()
+        );
+        endpoints.push(ep);
+    }
+    Ok(endpoints)
+}
+
+fn datagram_error_kind(e: &SendDatagramError) -> &'static str {
+    match e {
+        SendDatagramError::UnsupportedByPeer => "unsupported_by_peer",
+        SendDatagramError::Disabled => "disabled",
+        SendDatagramError::TooLarge => "too_large",
+        SendDatagramError::ConnectionLost(_) => "connection_lost",
+    }
+}
 
 fn test_conn(conn: &Connection) -> bool {
     match conn.close_reason() {

@@ -1,3 +1,4 @@
+ARG CACHE_BUST_WEEKLY
 FROM corrosion
 
 RUN apt-get update && apt-get install -y curl socat python3
@@ -9,6 +10,7 @@ RUN pip install antithesis cffi pg8000 --break-system-packages
 COPY .antithesis/client/test-templates/parallel_driver* /opt/antithesis/test/v1/basic_test/
 
 COPY .antithesis/client/test-templates/eventually_* /opt/antithesis/test/v1/basic_test/
+COPY .antithesis/client/test-templates/finally_* /opt/antithesis/test/v1/basic_test/
 
 COPY .antithesis/client/test-templates/anytime_* /opt/antithesis/test/v1/basic_test/
 

@@ -1,7 +1,10 @@
 [package]
 name = "corrosion"
 version = "0.2.0-beta.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [dependencies]
 antithesis_sdk = { workspace = true }
@@ -37,6 +40,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 shellwords = { version = "1" }
 spawn = { path = "../spawn" }
+speedy = { workspace = true }
 sqlite3-restore = { path = "../sqlite3-restore" }
 tempfile = { workspace = true }
 thiserror = { workspace = true }

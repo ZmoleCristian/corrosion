@@ -2,12 +2,15 @@
 pub mod actor;
 pub mod agent;
 pub mod api;
+pub mod bookie;
 pub mod broadcast;
 pub mod change;
 pub mod channel;
+pub mod compress;
 pub mod config;
 pub mod gauge;
 pub mod members;
+pub mod metrics_tracker;
 pub mod pubsub;
 pub mod schema;
 pub mod sqlite;

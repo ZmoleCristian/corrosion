@@ -1,12 +1,16 @@
 [package]
 name = "corro-agent"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 antithesis_sdk = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
@@ -34,6 +38,7 @@ metrics = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 pin-project-lite.workspace = true
+plum-foca = { path = "../plum-foca" }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 quinn-plaintext = { workspace = true }
@@ -67,6 +72,7 @@ uuid = { workspace = true }
 corro-pg = { path = "../corro-pg" }
 indexmap = { workspace = true }
 governor.workspace = true
+zstd = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }

@@ -1,28 +1,20 @@
 use std::{
-    cmp,
-    collections::{btree_map, BTreeMap, HashMap, HashSet},
-    fmt,
     future::Future,
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 use antithesis_sdk::assert_unreachable;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use camino::Utf8PathBuf;
-use compact_str::{CompactString, ToCompactString};
-use indexmap::IndexMap;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlite_pool::SqliteConn;
@@ -31,36 +23,45 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio::{
-    sync::{
-        AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
-        RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
-        RwLockWriteGuard as TokioRwLockWriteGuard,
-    },
+    sync::{AcquireError, OwnedSemaphorePermit},
     time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 use tripwire::Tripwire;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
-    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
+    broadcast::{
+        BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeInput,
+        PlumtreeUpdates, Timestamp,
+    },
     channel::{bounded, CorroSender},
-    config::Config,
+    compress::ZstdDicts,
+    config::{BroadcastMethod, Config},
+    metrics_tracker::MetricsTracker,
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
-        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, trace_heavy_queries,
-        unnest_param, CrConn, Migration, SqlitePool, SqlitePoolError,
+        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, trace_heavy_queries, CrConn,
+        Migration, SqlitePool, SqlitePoolError,
     },
     updates::UpdatesManager,
 };
+
+pub use crate::bookie::{Booked, BookedVersions, BookedWriteTx, Bookie, BookieWriteGuard};
 
 use super::members::Members;
 
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplyTrigger {
+    Version(ActorId, CrsqlDbVersion),
+    SchemaChanged,
+}
 
 pub struct AgentConfig {
     pub actor_id: ActorId,
@@ -73,12 +74,18 @@ pub struct AgentConfig {
     pub clock: Arc<uhlc::HLC>,
 
     pub booked: Booked,
+    pub bookie: Bookie,
 
     pub tx_bcast: CorroSender<BroadcastInput>,
-    pub tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
+    pub tx_apply: CorroSender<ApplyTrigger>,
     pub tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
-    pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    pub tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     pub tx_foca: CorroSender<FocaInput>,
+    pub tx_plumtree: CorroSender<PlumtreeInput>,
+    pub tx_plumtree_updates: CorroSender<PlumtreeUpdates>,
+
+    /// Trained zstd dictionary for broadcast compression, if configured.
+    pub change_dict: Option<Arc<ZstdDicts>>,
 
     pub write_sema: Arc<Semaphore>,
 
@@ -89,7 +96,12 @@ pub struct AgentConfig {
 
     pub updates_manager: UpdatesManager,
 
+    pub metrics_tracker: MetricsTracker,
+
     pub tripwire: Tripwire,
+
+    pub fatal_issue: Arc<OnceLock<String>>,
+    pub shutdown_token: CancellationToken,
 }
 
 pub struct AgentInner {
@@ -100,19 +112,27 @@ pub struct AgentInner {
     external_addr: Option<SocketAddr>,
     api_addr: SocketAddr,
     members: RwLock<Members>,
+    metrics_tracker: MetricsTracker,
     clock: Arc<uhlc::HLC>,
     booked: Booked,
+    bookie: Bookie,
     tx_bcast: CorroSender<BroadcastInput>,
-    tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
+    tx_apply: CorroSender<ApplyTrigger>,
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
-    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     tx_foca: CorroSender<FocaInput>,
+    tx_plumtree: CorroSender<PlumtreeInput>,
+    tx_plumtree_updates: CorroSender<PlumtreeUpdates>,
+    broadcaster: Broadcaster,
+    change_dict: Arc<ArcSwapOption<ZstdDicts>>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     cluster_id: ArcSwap<ClusterId>,
     limits: Limits,
     subs_manager: SubsManager,
     updates_manager: UpdatesManager,
+    fatal_issue: Arc<OnceLock<String>>,
+    shutdown_token: CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +142,10 @@ pub struct Limits {
 
 impl Agent {
     pub fn new(config: AgentConfig) -> Self {
+        let broadcaster = match config.config.load().gossip.broadcast.method() {
+            BroadcastMethod::Gossip => Broadcaster::Gossip(config.tx_bcast.clone()),
+            BroadcastMethod::Plumtree => Broadcaster::Plumtree(config.tx_plumtree.clone()),
+        };
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
             pool: config.pool,
@@ -130,13 +154,19 @@ impl Agent {
             external_addr: config.external_addr,
             api_addr: config.api_addr,
             members: config.members,
+            metrics_tracker: config.metrics_tracker,
             clock: config.clock,
             booked: config.booked,
+            bookie: config.bookie,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
+            tx_plumtree: config.tx_plumtree,
+            tx_plumtree_updates: config.tx_plumtree_updates,
+            broadcaster,
+            change_dict: Arc::new(ArcSwapOption::from(config.change_dict)),
             write_sema: config.write_sema,
             schema: config.schema,
             cluster_id: ArcSwap::from_pointee(config.cluster_id),
@@ -145,6 +175,8 @@ impl Agent {
             },
             subs_manager: config.subs_manager,
             updates_manager: config.updates_manager,
+            fatal_issue: config.fatal_issue,
+            shutdown_token: config.shutdown_token,
         }))
     }
 
@@ -191,11 +223,11 @@ impl Agent {
         &self.0.tx_bcast
     }
 
-    pub fn tx_apply(&self) -> &CorroSender<(ActorId, CrsqlDbVersion)> {
+    pub fn tx_apply(&self) -> &CorroSender<ApplyTrigger> {
         &self.0.tx_apply
     }
 
-    pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource)> {
+    pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)> {
         &self.0.tx_changes
     }
 
@@ -205,6 +237,26 @@ impl Agent {
 
     pub fn tx_foca(&self) -> &CorroSender<FocaInput> {
         &self.0.tx_foca
+    }
+
+    pub fn tx_plumtree(&self) -> &CorroSender<PlumtreeInput> {
+        &self.0.tx_plumtree
+    }
+
+    pub fn tx_plumtree_updates(&self) -> &CorroSender<PlumtreeUpdates> {
+        &self.0.tx_plumtree_updates
+    }
+
+    pub fn change_dict(&self) -> Option<Arc<ZstdDicts>> {
+        self.0.change_dict.load_full()
+    }
+
+    pub fn change_dict_slot(&self) -> Arc<ArcSwapOption<ZstdDicts>> {
+        self.0.change_dict.clone()
+    }
+
+    pub fn set_change_dict(&self, dicts: Option<Arc<ZstdDicts>>) {
+        self.0.change_dict.store(dicts);
     }
 
     pub fn write_sema(&self) -> &Arc<Semaphore> {
@@ -223,6 +275,10 @@ impl Agent {
         &self.0.booked
     }
 
+    pub fn bookie(&self) -> &Bookie {
+        &self.0.bookie
+    }
+
     pub fn members(&self) -> &RwLock<Members> {
         &self.0.members
     }
@@ -231,12 +287,26 @@ impl Agent {
         &self.0.schema
     }
 
+    pub fn metrics_tracker(&self) -> &MetricsTracker {
+        &self.0.metrics_tracker
+    }
+
     pub fn db_path(&self) -> Utf8PathBuf {
         self.0.config.load().db.path.clone()
     }
 
     pub fn config(&self) -> arc_swap::Guard<Arc<Config>, arc_swap::strategy::DefaultStrategy> {
         self.0.config.load()
+    }
+
+    pub fn broadcast_method(&self) -> BroadcastMethod {
+        self.config().gossip.broadcast_method()
+    }
+
+    /// Route changes to the active dissemination method, resolved once from
+    /// [`BroadcastMethod`] at construction.
+    pub fn broadcaster(&self) -> &Broadcaster {
+        &self.0.broadcaster
     }
 
     pub fn set_config(&self, new_conf: Config) {
@@ -253,6 +323,19 @@ impl Agent {
 
     pub fn updates_manager(&self) -> &UpdatesManager {
         &self.0.updates_manager
+    }
+
+    pub fn fatal_issue(&self) -> Option<&str> {
+        self.0.fatal_issue.get().map(String::as_str)
+    }
+
+    pub fn shutdown_token(&self) -> &CancellationToken {
+        &self.0.shutdown_token
+    }
+
+    pub fn mark_unhealthy(&self, reason: &str) {
+        let _ = self.0.fatal_issue.set(reason.to_owned());
+        self.0.shutdown_token.cancel();
     }
 
     pub fn set_cluster_id(&self, cluster_id: ClusterId) {
@@ -277,6 +360,56 @@ impl Agent {
             .map_err(|e| format!("could not convert ActorId to uhlc ID: {e}"))?;
         self.clock()
             .update_with_timestamp(&uhlc::Timestamp::new(ts.0, id))
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Routes changes based on configured broadcast method.
+pub enum Broadcaster {
+    Gossip(CorroSender<BroadcastInput>),
+    Plumtree(CorroSender<PlumtreeInput>),
+}
+
+impl Broadcaster {
+    pub fn broadcast_local(&self, change: ChangeV1) {
+        match self {
+            Broadcaster::Gossip(tx) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx
+                        .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(change)))
+                        .await
+                    {
+                        debug!("could not queue change for gossip broadcast: {e}");
+                    }
+                });
+            }
+            Broadcaster::Plumtree(tx) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send(PlumtreeInput::Broadcast(change)).await {
+                        error!("could not send change for plumtree broadcast: {e}");
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn rebroadcast(&self, change: &ChangeV1, original_bcast: Option<BroadcastV1>) {
+        match self {
+            Broadcaster::Gossip(tx) => {
+                // reuse received compressed broadcast if available
+                let bcast = original_bcast.unwrap_or_else(|| BroadcastV1::Change(change.clone()));
+                let input = BroadcastInput::Rebroadcast(bcast);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send(input).await {
+                        debug!("could not queue change for gossip rebroadcast: {e}");
+                    }
+                });
+            }
+            Broadcaster::Plumtree(_) => {}
+        }
     }
 }
 
@@ -382,6 +515,18 @@ fn crsqlite_v0_17_migration(
     let ts = Timestamp::from(clock.new_timestamp()).as_u64().to_string();
 
     move |tx: &Transaction| -> rusqlite::Result<()> {
+        let version: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM crsql_master WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // we only want to run this migration if the version is less than 17_00_00
+        if version.is_none_or(|v| v >= 17_00_00) {
+            return Ok(());
+        }
+
         let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
 
         for table in tables {
@@ -426,6 +571,22 @@ fn crsqlite_v0_17_migration(
     }
 }
 
+// TODO: enable this down the line
+// fn crsqlite_ts_index() -> impl Fn(&Transaction) -> rusqlite::Result<()> {
+//     |tx: &Transaction| -> rusqlite::Result<()> {
+//         let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+//         for table in tables {
+//             tx.execute(
+//                 &format!("CREATE INDEX IF NOT EXISTS {table}_ts ON {table} (ts)"),
+//                 [],
+//             )?;
+//         }
+
+//         Ok(())
+//     }
+// }
+
 #[derive(Debug, Clone)]
 pub struct SplitPool(Arc<SplitPoolInner>);
 
@@ -433,6 +594,7 @@ pub struct SplitPool(Arc<SplitPoolInner>);
 struct SplitPoolInner {
     path: PathBuf,
     write_sema: Arc<Semaphore>,
+    cache_size_kib: i64,
 
     read: SqlitePool,
     write: SqlitePool,
@@ -476,6 +638,38 @@ pub enum ChangeError {
     SchemaChanged { expected: i64, actual: i64 },
 }
 
+impl ChangeError {
+    pub fn fatal_db_issue_for_code(code: rusqlite::ErrorCode) -> Option<&'static str> {
+        match code {
+            rusqlite::ErrorCode::DiskFull => Some("disk full"),
+            rusqlite::ErrorCode::SystemIoFailure => Some("I/O error on database"),
+            rusqlite::ErrorCode::DatabaseCorrupt => Some("database is corrupt"),
+            rusqlite::ErrorCode::ReadOnly => Some("database filesystem is read-only"),
+            _ => None,
+        }
+    }
+
+    pub fn sqlite_error_code(&self) -> Option<rusqlite::ErrorCode> {
+        match self {
+            Self::Rusqlite { source, .. } => source.sqlite_error_code(),
+            _ => None,
+        }
+    }
+
+    pub fn fatal_db_issue(&self) -> Option<&'static str> {
+        self.sqlite_error_code()
+            .and_then(Self::fatal_db_issue_for_code)
+    }
+
+    pub fn is_oom_error(&self) -> bool {
+        self.sqlite_error_code() == Some(rusqlite::ErrorCode::OutOfMemory)
+    }
+
+    pub fn is_interrupt_error(&self) -> bool {
+        self.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SplitPoolCreateError {
     #[error(transparent)]
@@ -490,10 +684,11 @@ impl SplitPool {
     pub async fn create<P: AsRef<Path>>(
         path: P,
         write_sema: Arc<Semaphore>,
+        cache_size_kib: i64,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .create_pool_transform(rusqlite_to_crsqlite_write)?;
+            .create_pool_transform(move |conn| rusqlite_to_crsqlite_write(conn, cache_size_kib))?;
 
         debug!("built RW pool");
 
@@ -506,12 +701,19 @@ impl SplitPool {
         Ok(Self::new(
             path.as_ref().to_owned(),
             write_sema,
+            cache_size_kib,
             ro_pool,
             rw_pool,
         ))
     }
 
-    fn new(path: PathBuf, write_sema: Arc<Semaphore>, read: SqlitePool, write: SqlitePool) -> Self {
+    fn new(
+        path: PathBuf,
+        write_sema: Arc<Semaphore>,
+        cache_size_kib: i64,
+        read: SqlitePool,
+        write: SqlitePool,
+    ) -> Self {
         let (priority_tx, mut priority_rx) = bounded(256, "priority");
         let (normal_tx, mut normal_rx) = bounded(512, "normal");
         let (low_tx, mut low_rx) = bounded(1024, "low");
@@ -533,6 +735,7 @@ impl SplitPool {
         Self(Arc::new(SplitPoolInner {
             path,
             write_sema,
+            cache_size_kib,
             read,
             write,
             priority_tx,
@@ -582,7 +785,7 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        let cr_conn = rusqlite_to_crsqlite_write(conn)?;
+        let cr_conn = rusqlite_to_crsqlite_write(conn, self.0.cache_size_kib)?;
         trace_heavy_queries(cr_conn.conn())?;
         Ok(cr_conn)
     }
@@ -721,366 +924,6 @@ impl DerefMut for WriteConn {
         &mut self.conn
     }
 }
-pub struct CountedTokioRwLock<T> {
-    registry: LockRegistry,
-    lock: Arc<TokioRwLock<T>>,
-}
-
-impl<T> CountedTokioRwLock<T> {
-    fn new(registry: LockRegistry, value: T) -> Self {
-        Self {
-            registry,
-            lock: Arc::new(TokioRwLock::new(value)),
-        }
-    }
-
-    #[tracing::instrument(skip_all, level = "debug")]
-    pub async fn write<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockWriteGuard<'_, T> {
-        self.registry.acquire_write(label, extra, &self.lock).await
-    }
-
-    #[tracing::instrument(skip_all, level = "debug")]
-    pub async fn write_owned<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
-        self.registry
-            .acquire_write_owned(label, extra, self.lock.clone())
-            .await
-    }
-
-    #[tracing::instrument(skip_all, level = "debug")]
-    pub fn blocking_write<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockWriteGuard<'_, T> {
-        self.registry
-            .acquire_blocking_write(label, extra, &self.lock)
-    }
-
-    #[tracing::instrument(skip_all, level = "debug")]
-    pub fn blocking_write_owned<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
-        self.registry
-            .acquire_blocking_write_owned(label, extra, self.lock.clone())
-    }
-
-    #[tracing::instrument(skip_all, level = "debug")]
-    pub fn blocking_read<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockReadGuard<'_, T> {
-        self.registry
-            .acquire_blocking_read(label, extra, &self.lock)
-    }
-
-    #[tracing::instrument(skip_all, level = "debug")]
-    pub async fn read<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockReadGuard<'_, T> {
-        self.registry.acquire_read(label, extra, &self.lock).await
-    }
-
-    pub fn registry(&self) -> &LockRegistry {
-        &self.registry
-    }
-}
-
-pub struct CountedTokioRwLockWriteGuard<'a, T> {
-    lock: TokioRwLockWriteGuard<'a, T>,
-    _tracker: LockTracker,
-}
-
-impl<'a, T> Deref for CountedTokioRwLockWriteGuard<'a, T> {
-    type Target = TokioRwLockWriteGuard<'a, T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.lock
-    }
-}
-
-impl<'a, T> DerefMut for CountedTokioRwLockWriteGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.lock
-    }
-}
-
-pub struct CountedOwnedTokioRwLockWriteGuard<T> {
-    lock: OwnedTokioRwLockWriteGuard<T>,
-    _tracker: LockTracker,
-}
-
-impl<T> Deref for CountedOwnedTokioRwLockWriteGuard<T> {
-    type Target = OwnedTokioRwLockWriteGuard<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.lock
-    }
-}
-
-impl<T> DerefMut for CountedOwnedTokioRwLockWriteGuard<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.lock
-    }
-}
-
-pub struct CountedTokioRwLockReadGuard<'a, T> {
-    lock: TokioRwLockReadGuard<'a, T>,
-    _tracker: LockTracker,
-}
-
-impl<'a, T> Deref for CountedTokioRwLockReadGuard<'a, T> {
-    type Target = TokioRwLockReadGuard<'a, T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.lock
-    }
-}
-
-impl<'a, T> DerefMut for CountedTokioRwLockReadGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.lock
-    }
-}
-
-type LockId = usize;
-
-#[derive(Debug, Clone)]
-pub struct LockMeta {
-    pub label: &'static str,
-    pub extra: Option<CompactString>,
-    pub kind: LockKind,
-    pub state: LockState,
-    pub started_at: Instant,
-}
-
-#[derive(Default, Clone)]
-pub struct LockRegistry {
-    id_gen: Arc<AtomicUsize>,
-    pub map: Arc<RwLock<IndexMap<LockId, LockMeta>>>,
-}
-
-impl LockRegistry {
-    fn remove(&self, id: &LockId) {
-        self.map.write().shift_remove(id);
-    }
-
-    async fn acquire_write<'a, T, C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-        lock: &'a TokioRwLock<T>,
-    ) -> CountedTokioRwLockWriteGuard<'a, T> {
-        let id = self.gen_id();
-        self.insert_lock(
-            id,
-            LockMeta {
-                label,
-                extra: extra.into().map(|d| d.to_compact_string()),
-                kind: LockKind::Write,
-                state: LockState::Acquiring,
-                started_at: Instant::now(),
-            },
-        );
-        let _tracker = LockTracker {
-            id,
-            registry: self.clone(),
-        };
-        let w = lock.write().await;
-        self.set_lock_state(&id, LockState::Locked);
-        CountedTokioRwLockWriteGuard { lock: w, _tracker }
-    }
-
-    async fn acquire_write_owned<T, C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-        lock: Arc<TokioRwLock<T>>,
-    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
-        let id = self.gen_id();
-        self.insert_lock(
-            id,
-            LockMeta {
-                label,
-                extra: extra.into().map(|d| d.to_compact_string()),
-                kind: LockKind::Write,
-                state: LockState::Acquiring,
-                started_at: Instant::now(),
-            },
-        );
-        let _tracker = LockTracker {
-            id,
-            registry: self.clone(),
-        };
-        let w = lock.write_owned().await;
-        self.set_lock_state(&id, LockState::Locked);
-        CountedOwnedTokioRwLockWriteGuard { lock: w, _tracker }
-    }
-
-    fn acquire_blocking_write<'a, T, C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-        lock: &'a TokioRwLock<T>,
-    ) -> CountedTokioRwLockWriteGuard<'a, T> {
-        let id = self.gen_id();
-        self.insert_lock(
-            id,
-            LockMeta {
-                label,
-                extra: extra.into().map(|d| d.to_compact_string()),
-                kind: LockKind::Write,
-                state: LockState::Acquiring,
-                started_at: Instant::now(),
-            },
-        );
-        let _tracker = LockTracker {
-            id,
-            registry: self.clone(),
-        };
-        let w = lock.blocking_write();
-        self.set_lock_state(&id, LockState::Locked);
-        CountedTokioRwLockWriteGuard { lock: w, _tracker }
-    }
-
-    fn acquire_blocking_write_owned<T, C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-        lock: Arc<TokioRwLock<T>>,
-    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
-        let id = self.gen_id();
-        self.insert_lock(
-            id,
-            LockMeta {
-                label,
-                extra: extra.into().map(|d| d.to_compact_string()),
-                kind: LockKind::Write,
-                state: LockState::Acquiring,
-                started_at: Instant::now(),
-            },
-        );
-        let _tracker = LockTracker {
-            id,
-            registry: self.clone(),
-        };
-        let w = loop {
-            if let Ok(w) = lock.clone().try_write_owned() {
-                break w;
-            }
-            // don't instantly loop
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        self.set_lock_state(&id, LockState::Locked);
-        CountedOwnedTokioRwLockWriteGuard { lock: w, _tracker }
-    }
-
-    async fn acquire_read<'a, T, C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-        lock: &'a TokioRwLock<T>,
-    ) -> CountedTokioRwLockReadGuard<'a, T> {
-        let id = self.gen_id();
-        self.insert_lock(
-            id,
-            LockMeta {
-                label,
-                extra: extra
-                    .into()
-                    .map(|d| d.to_compact_string())
-                    .map(|d| d.to_compact_string()),
-                kind: LockKind::Read,
-                state: LockState::Acquiring,
-                started_at: Instant::now(),
-            },
-        );
-        let _tracker = LockTracker {
-            id,
-            registry: self.clone(),
-        };
-        let w = lock.read().await;
-        self.set_lock_state(&id, LockState::Locked);
-        CountedTokioRwLockReadGuard { lock: w, _tracker }
-    }
-
-    fn acquire_blocking_read<'a, T, C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-        lock: &'a TokioRwLock<T>,
-    ) -> CountedTokioRwLockReadGuard<'a, T> {
-        let id = self.gen_id();
-        self.insert_lock(
-            id,
-            LockMeta {
-                label,
-                extra: extra.into().map(|d| d.to_compact_string()),
-                kind: LockKind::Read,
-                state: LockState::Acquiring,
-                started_at: Instant::now(),
-            },
-        );
-        let _tracker = LockTracker {
-            id,
-            registry: self.clone(),
-        };
-        let w = lock.blocking_read();
-        self.set_lock_state(&id, LockState::Locked);
-        CountedTokioRwLockReadGuard { lock: w, _tracker }
-    }
-
-    fn set_lock_state(&self, id: &LockId, state: LockState) {
-        if let Some(meta) = self.map.write().get_mut(id) {
-            meta.state = state
-        }
-    }
-
-    fn insert_lock(&self, id: LockId, meta: LockMeta) {
-        self.map.write().insert(id, meta);
-    }
-
-    fn gen_id(&self) -> LockId {
-        self.id_gen.fetch_add(1, Ordering::Release) + 1
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LockState {
-    Acquiring,
-    Locked,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LockKind {
-    Read,
-    Write,
-}
-
-struct LockTracker {
-    id: LockId,
-    registry: LockRegistry,
-}
-
-impl Drop for LockTracker {
-    fn drop(&mut self) {
-        self.registry.remove(&self.id)
-    }
-}
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartialVersion {
@@ -1098,7 +941,7 @@ impl PartialVersion {
     }
 
     pub fn full_range(&self) -> RangeInclusive<CrsqlSeq> {
-        CrsqlSeq(1)..=self.last_seq
+        CrsqlSeq(0)..=self.last_seq
     }
 }
 
@@ -1114,786 +957,4 @@ pub enum KnownDbVersion {
     Cleared,
     Current(CurrentVersion),
     Partial(PartialVersion),
-}
-
-#[derive(Debug)]
-pub struct VersionsSnapshot {
-    actor_id: ActorId,
-    needed: RangeInclusiveSet<CrsqlDbVersion>,
-    partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
-    max: Option<CrsqlDbVersion>,
-}
-
-impl VersionsSnapshot {
-    pub fn needed(&self) -> &RangeInclusiveSet<CrsqlDbVersion> {
-        &self.needed
-    }
-
-    pub fn insert_gaps(&mut self, db_versions: RangeInclusiveSet<CrsqlDbVersion>) {
-        self.needed.extend(db_versions);
-    }
-
-    pub fn insert_db(
-        &mut self,         // only because we want 1 mt a time here
-        conn: &Connection, // usually a `Transaction`
-        db_versions: RangeInclusiveSet<CrsqlDbVersion>,
-    ) -> rusqlite::Result<()> {
-        trace!("wants to insert into db {db_versions:?}");
-        let mut changes = self.compute_gaps_change(db_versions);
-
-        trace!(actor_id = %self.actor_id, "delete: {:?}", changes.remove_ranges);
-        trace!(actor_id = %self.actor_id, "new: {:?}", changes.insert_set);
-
-        // those are actual ranges we had stored and will change, remove them from the DB
-        {
-            let remove_ranges = std::mem::take(&mut changes.remove_ranges);
-            let actors = unnest_param(remove_ranges.iter().map(|_| self.actor_id));
-            let starts = unnest_param(remove_ranges.iter().map(|r| r.start()));
-            let ends = unnest_param(remove_ranges.iter().map(|r| r.end()));
-            // TODO: use returning to discover which ranges were actually deleted
-            let count = conn
-                .prepare_cached(
-                    "
-                    DELETE FROM __corro_bookkeeping_gaps WHERE (actor_id, start, end) 
-                    IN (SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends))
-                    ",
-                )?
-                .execute(named_params! {
-                    ":actors": actors,
-                    ":starts": starts,
-                    ":ends": ends,
-                })?;
-            if count != remove_ranges.len() {
-                warn!(actor_id = %self.actor_id, "did not delete some gaps from db: {remove_ranges:?}");
-                let details: serde_json::Value = json!({"count": count, "ranges": remove_ranges});
-                assert_unreachable!("ineffective deletion of gaps in-db", &details);
-            }
-
-            for range in remove_ranges {
-                for version in CrsqlDbVersionRange::from(&range) {
-                    self.partials.remove(&version);
-                }
-                self.needed.remove(range);
-            }
-        }
-
-        {
-            let insert_set = std::mem::take(&mut changes.insert_set);
-            let actors = unnest_param(insert_set.iter().map(|_| self.actor_id));
-            let starts = unnest_param(insert_set.iter().map(|r| r.start()));
-            let ends = unnest_param(insert_set.iter().map(|r| r.end()));
-            debug!(actor_id = %self.actor_id, "inserting {insert_set:?}");
-            // TODO: use returning to discover which ranges were actually inserted
-            let count = conn
-                .prepare_cached(
-                    "
-                    INSERT OR IGNORE INTO __corro_bookkeeping_gaps (actor_id, start, end) 
-                    SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends)
-                    ",
-                )?
-                .execute(named_params! {
-                    ":actors": actors,
-                    ":starts": starts,
-                    ":ends": ends,
-                })?;
-            if count != insert_set.len() {
-                warn!(actor_id = %self.actor_id, "did not insert some gaps into db: {insert_set:?}");
-
-                let existing: Vec<(ActorId, CrsqlDbVersion, CrsqlDbVersion)> = conn
-                    .prepare_cached(
-                        "
-                    SELECT actor_id, start, end FROM __corro_bookkeeping_gaps 
-                    WHERE (actor_id, start) 
-                    IN (SELECT value0, value1 FROM unnest(:actors, :starts))",
-                    )?
-                    .query_map(
-                        named_params! {
-                            ":actors": actors,
-                            ":starts": starts,
-                        },
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                warn!("already had gaps entries! existing: {existing:?}");
-                let details: serde_json::Value =
-                    json!({"count": count, "insert_set": insert_set, "existing": existing});
-                assert_unreachable!("ineffective insertion of gaps in-db", &details);
-                return Err(rusqlite::Error::ModuleError(
-                    "Gaps entries already present in DB".to_string(),
-                ));
-            }
-
-            for range in insert_set {
-                self.needed.insert(range);
-            }
-        }
-
-        self.max = changes.max.take();
-
-        Ok(())
-    }
-
-    fn compute_gaps_change(&self, versions: RangeInclusiveSet<CrsqlDbVersion>) -> GapsChanges {
-        trace!("needed: {:?}", self.needed);
-
-        let mut changes = GapsChanges {
-            // set as the current max
-            max: self.max,
-
-            insert_set: Default::default(),
-            remove_ranges: Default::default(),
-        };
-
-        for versions in versions.clone() {
-            // only update the max if it's bigger
-            changes.max = cmp::max(changes.max, Some(*versions.end()));
-
-            // iterate all partially or fully overlapping changes
-            for range in self.needed.overlapping(&versions) {
-                trace!(actor_id = %self.actor_id, "overlapping: {range:?}");
-                // insert the overlapping range in the set (collapses ajoining ranges)
-                changes.insert_set.insert(range.clone());
-                // remove the range, they'll be added back from the insert set ^
-                changes.remove_ranges.insert(range.clone());
-            }
-
-            // check if there's a previous range with an end version = start version - 1
-            if let Some(range) = self.needed.get(&CrsqlDbVersion(versions.start().0 - 1)) {
-                trace!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
-                // insert the collapsible range
-                changes.insert_set.insert(range.clone());
-                // remove the collapsible range
-                changes.remove_ranges.insert(range.clone());
-            }
-
-            // check if there's a next range with an start version = end version + 1
-            if let Some(range) = self.needed.get(&CrsqlDbVersion(versions.end().0 + 1)) {
-                trace!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
-                // insert the collapsible range
-                changes.insert_set.insert(range.clone());
-                // remove the collapsible range
-                changes.remove_ranges.insert(range.clone());
-            }
-
-            // either a max or 0
-            // TODO: figure out if we want to use 0 instead of None in the struct by default
-            let current_max = self.max.unwrap_or_default();
-
-            // check if there's a gap created between our current max and the start version we just inserted
-            let gap_start = current_max + 1;
-            if gap_start < *versions.start() {
-                let range = gap_start..=*versions.start();
-                trace!("inserting gap between max + 1 and start: {range:?}");
-                changes.insert_set.insert(range.clone());
-                for range in self.needed.overlapping(&range) {
-                    changes.insert_set.insert(range.clone());
-                    changes.remove_ranges.insert(range.clone());
-                }
-            }
-        }
-
-        for versions in versions {
-            // we now know the applied versions
-            changes.insert_set.remove(versions.clone());
-        }
-
-        changes
-    }
-}
-
-// this struct must be drained!
-impl Drop for VersionsSnapshot {
-    fn drop(&mut self) {
-        trace!("dropping snapshot: {self:?}");
-        if !self.needed.is_empty() {
-            warn!(actor_id = %self.actor_id, "needed versions from snapshot were not drained: {:?}", self.needed);
-        }
-        debug_assert!(
-            self.needed.is_empty(),
-            "needed versions from snapshot were not drained"
-        );
-        if !self.partials.is_empty() {
-            warn!(actor_id = %self.actor_id, "partials were not drained: {:?}", self.partials);
-        }
-        debug_assert!(
-            self.partials.is_empty(),
-            "partials from snapshot were not drained!"
-        );
-        debug_assert!(self.max.is_none(), "max value was not applied");
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BookedVersions {
-    actor_id: ActorId,
-    pub partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
-    needed: RangeInclusiveSet<CrsqlDbVersion>,
-    max: Option<CrsqlDbVersion>,
-}
-
-impl BookedVersions {
-    pub fn new(actor_id: ActorId) -> Self {
-        Self {
-            actor_id,
-            partials: Default::default(),
-            needed: Default::default(),
-            max: Default::default(),
-        }
-    }
-
-    pub fn actor_id(&self) -> ActorId {
-        self.actor_id
-    }
-
-    pub fn from_conn(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
-        trace!("from_conn");
-        let mut bv = BookedVersions::new(actor_id);
-
-        // fetch the biggest version we know, a partial version might override
-        // this below
-        bv.max = conn
-            .prepare_cached("SELECT db_version FROM crsql_db_versions WHERE site_id = ?")?
-            .query_row([actor_id], |row| row.get(0))
-            .optional()?;
-
-        {
-            // fetch known partial sequences
-            let mut prepped = conn.prepare_cached(
-            "SELECT db_version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping WHERE site_id = ?",
-            )?;
-            let mut rows = prepped.query([actor_id])?;
-
-            loop {
-                let row = rows.next()?;
-                match row {
-                    None => break,
-                    Some(row) => {
-                        let version = row.get(0)?;
-                        // NOTE: use normal insert logic to have a consistent behavior
-                        bv.insert_partial(
-                            version,
-                            PartialVersion {
-                                seqs: RangeInclusiveSet::from_iter(vec![row.get(1)?..=row.get(2)?]),
-                                last_seq: row.get(3)?,
-                                ts: row.get(4)?,
-                            },
-                        );
-                    }
-                }
-            }
-        }
-
-        let mut snap = bv.snapshot();
-
-        {
-            // fetch the sync's needed version gaps
-            let mut prepped = conn.prepare_cached(
-                "SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?",
-            )?;
-            let mut rows = prepped.query([actor_id])?;
-
-            loop {
-                let row = rows.next()?;
-                match row {
-                    None => break,
-                    Some(row) => {
-                        let start_v = row.get(0)?;
-                        let end_v = row.get(1)?;
-
-                        // TODO: don't do this manually...
-                        snap.needed.insert(start_v..=end_v);
-                        // max for booked versions shouldn't come from gaps
-                        if Some(end_v) > snap.max {
-                            warn!(%actor_id, %start_v, %end_v, max = ?snap.max, "max for actor is less than gap");
-                        }
-                    }
-                }
-            }
-        }
-
-        bv.commit_snapshot(snap);
-
-        Ok(bv)
-    }
-
-    pub fn contains_version(&self, version: &CrsqlDbVersion) -> bool {
-        // corrosion knows about a version if...
-
-        // it's not in the list of needed versions
-        !self.needed.iter().any(|range| range.start() <= version && version <= range.end()) &&
-        // and the last known version is bigger than the requested version
-        self.max.unwrap_or_default() >= *version
-        // we don't need to look at partials because if we have a partial
-        // then it fulfills the previous conditions
-    }
-
-    pub fn get_partial(&self, version: &CrsqlDbVersion) -> Option<&PartialVersion> {
-        self.partials.get(version)
-    }
-
-    pub fn contains(&self, version: CrsqlDbVersion, seqs: Option<CrsqlSeqRange>) -> bool {
-        self.contains_version(&version)
-            && seqs
-                .map(|mut check_seqs| match self.partials.get(&version) {
-                    Some(partial) => check_seqs.all(|seq| partial.seqs.contains(&seq)),
-                    // if `contains_version` is true but we don't have a partial version,
-                    // then we must have it as a fully applied or cleared version
-                    None => true,
-                })
-                .unwrap_or(true)
-    }
-
-    #[inline]
-    pub fn contains_all(
-        &self,
-        versions: impl Into<CrsqlDbVersionRange>,
-        seqs: Option<CrsqlSeqRange>,
-    ) -> bool {
-        versions.into().all(|version| self.contains(version, seqs))
-    }
-
-    pub fn last(&self) -> Option<CrsqlDbVersion> {
-        self.max
-    }
-
-    pub fn commit_snapshot(&mut self, mut snap: VersionsSnapshot) {
-        debug!("comitting snapshot");
-        self.needed = std::mem::take(&mut snap.needed);
-        self.partials = std::mem::take(&mut snap.partials);
-        self.max = snap.max.take();
-    }
-
-    pub fn snapshot(&self) -> VersionsSnapshot {
-        trace!("creating snapshot");
-        VersionsSnapshot {
-            actor_id: self.actor_id,
-            needed: self.needed.clone(),
-            partials: self.partials.clone(),
-            max: self.max,
-        }
-    }
-
-    // used when the commit has succeeded
-    pub fn insert_partial(
-        &mut self,
-        version: CrsqlDbVersion,
-        partial: PartialVersion,
-    ) -> PartialVersion {
-        debug!(actor_id = %self.actor_id, "insert partial {version:?}");
-
-        match self.partials.entry(version) {
-            btree_map::Entry::Vacant(entry) => {
-                self.max = cmp::max(self.max, Some(version));
-                entry.insert(partial).clone()
-            }
-            btree_map::Entry::Occupied(mut entry) => {
-                let got = entry.get_mut();
-                got.seqs.extend(partial.seqs);
-                got.clone()
-            }
-        }
-    }
-
-    pub fn needed(&self) -> &RangeInclusiveSet<CrsqlDbVersion> {
-        &self.needed
-    }
-}
-
-#[derive(Debug)]
-pub struct GapsChanges {
-    max: Option<CrsqlDbVersion>,
-    insert_set: RangeInclusiveSet<CrsqlDbVersion>,
-    remove_ranges: HashSet<RangeInclusive<CrsqlDbVersion>>,
-}
-
-pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
-
-#[derive(Clone)]
-pub struct Booked(BookedInner);
-
-impl Booked {
-    pub fn new(versions: BookedVersions, registry: LockRegistry) -> Self {
-        Self(Arc::new(CountedTokioRwLock::new(registry, versions)))
-    }
-
-    pub async fn read<D: fmt::Display, E: Into<Option<D>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockReadGuard<'_, BookedVersions> {
-        self.0.read(label, extra).await
-    }
-
-    pub async fn write<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
-        self.0.write(label, extra).await
-    }
-
-    pub async fn write_owned<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedOwnedTokioRwLockWriteGuard<BookedVersions> {
-        self.0.write_owned(label, extra).await
-    }
-
-    pub fn blocking_write<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
-        self.0.blocking_write(label, extra)
-    }
-
-    pub fn blocking_read<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockReadGuard<'_, BookedVersions> {
-        self.0.blocking_read(label, extra)
-    }
-
-    pub fn blocking_write_owned<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedOwnedTokioRwLockWriteGuard<BookedVersions> {
-        self.0.blocking_write_owned(label, extra)
-    }
-}
-
-#[derive(Default)]
-pub struct BookieInner {
-    map: HashMap<ActorId, Booked>,
-    registry: LockRegistry,
-}
-
-impl BookieInner {
-    pub fn ensure(&mut self, actor_id: ActorId) -> Booked {
-        self.map
-            .entry(actor_id)
-            .or_insert_with(|| {
-                Booked(Arc::new(CountedTokioRwLock::new(
-                    self.registry.clone(),
-                    BookedVersions::new(actor_id),
-                )))
-            })
-            .clone()
-    }
-
-    pub fn replace_actor(&mut self, actor_id: ActorId, bv: BookedVersions) {
-        self.map.insert(
-            actor_id,
-            Booked(Arc::new(CountedTokioRwLock::new(self.registry.clone(), bv))),
-        );
-    }
-}
-
-impl Deref for BookieInner {
-    type Target = HashMap<ActorId, Booked>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.map
-    }
-}
-
-impl DerefMut for BookieInner {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.map
-    }
-}
-
-#[derive(Clone)]
-pub struct Bookie(Arc<CountedTokioRwLock<BookieInner>>);
-
-impl Bookie {
-    pub fn new(map: HashMap<ActorId, BookedVersions>) -> Self {
-        let registry = LockRegistry::default();
-        Self::new_with_registry(map, registry)
-    }
-
-    pub fn new_with_registry(
-        map: HashMap<ActorId, BookedVersions>,
-        registry: LockRegistry,
-    ) -> Self {
-        Self(Arc::new(CountedTokioRwLock::new(
-            registry.clone(),
-            BookieInner {
-                map: map
-                    .into_iter()
-                    .map(|(k, v)| (k, Booked::new(v, registry.clone())))
-                    .collect(),
-                registry,
-            },
-        )))
-    }
-
-    pub async fn read<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockReadGuard<'_, BookieInner> {
-        self.0.read(label, extra).await
-    }
-
-    pub async fn write<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockWriteGuard<'_, BookieInner> {
-        self.0.write(label, extra).await
-    }
-
-    pub fn blocking_write<C: fmt::Display, E: Into<Option<C>>>(
-        &self,
-        label: &'static str,
-        extra: E,
-    ) -> CountedTokioRwLockWriteGuard<'_, BookieInner> {
-        self.0.blocking_write(label, extra)
-    }
-
-    pub fn registry(&self) -> &LockRegistry {
-        self.0.registry()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::base::{dbvr, dbvri};
-    use rangemap::range_inclusive_set;
-
-    #[test]
-    fn test_booked_insert_db() -> rusqlite::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-
-        let mut conn = CrConn::init(Connection::open_in_memory()?)?;
-        setup_conn(&conn)?;
-        let clock = Arc::new(uhlc::HLC::default());
-        migrate(clock, &mut conn)?;
-
-        let actor_id = ActorId::default();
-        let mut bv = BookedVersions::new(actor_id);
-
-        let mut all = RangeInclusiveSet::new();
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(1, 20)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![])?;
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(1, 10)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![])?;
-
-        // try from an empty state again
-        let mut bv = BookedVersions::new(actor_id);
-        let mut all = RangeInclusiveSet::new();
-
-        // create 2:=3 gap
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(1, 1), dbvri!(4, 4)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(2, 3)])?;
-
-        // fill gap
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(3, 3), dbvri!(2, 2)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![])?;
-
-        // try from an empty state again
-        let mut bv = BookedVersions::new(actor_id);
-        let mut all = RangeInclusiveSet::new();
-
-        // insert a non-1 first version
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(5, 20)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(1, 4)])?;
-
-        // insert a further change that does not overlap a gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![dbvri!(6, 7)])?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(1, 4)])?;
-
-        // insert a further change that does overlap a gap
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![dbvri!(3, 7)])?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(1, 2)])?;
-
-        insert_everywhere(&conn, &mut bv, &mut all, range_inclusive_set![dbvri!(1, 2)])?;
-        expect_gaps(&conn, &bv, &all, vec![])?;
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(25, 25)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(21, 24)])?;
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(30, 35)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(21, 24), dbvr!(26, 29)])?;
-
-        // NOTE: overlapping partially from the end
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(19, 22)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(23, 24), dbvr!(26, 29)])?;
-
-        // NOTE: overlapping partially from the start
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(24, 25)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(23, 23), dbvr!(26, 29)])?;
-
-        // NOTE: overlapping 2 ranges
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(23, 27)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(28, 29)])?;
-
-        // NOTE: ineffective insert of already known ranges
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(1, 20)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(28, 29)])?;
-
-        // NOTE: overlapping no ranges, but encompassing a full range
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(27, 30)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![])?;
-
-        // NOTE: touching multiple ranges, partially
-
-        // create gap 36..=39
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(40, 45)],
-        )?;
-        // create gap 46..=49
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(50, 55)],
-        )?;
-
-        insert_everywhere(
-            &conn,
-            &mut bv,
-            &mut all,
-            range_inclusive_set![dbvri!(38, 47)],
-        )?;
-        expect_gaps(&conn, &bv, &all, vec![dbvr!(36, 37), dbvr!(48, 49)])?;
-
-        // test loading a bv from the conn, they should be identical!
-        let mut bv2 = BookedVersions::from_conn(&conn, actor_id)?;
-        // manually set the last version because there's nothing in `__corro_bookkeeping`
-        bv2.max = Some(CrsqlDbVersion(55));
-
-        assert_eq!(bv, bv2);
-
-        Ok(())
-    }
-
-    fn insert_everywhere(
-        conn: &Connection,
-        bv: &mut BookedVersions,
-        all_versions: &mut RangeInclusiveSet<CrsqlDbVersion>,
-        versions: RangeInclusiveSet<CrsqlDbVersion>,
-    ) -> rusqlite::Result<()> {
-        all_versions.extend(versions.clone());
-        let mut snap = bv.snapshot();
-        snap.insert_db(conn, versions)?;
-        bv.commit_snapshot(snap);
-        Ok(())
-    }
-
-    fn expect_gaps(
-        conn: &Connection,
-        bv: &BookedVersions,
-        all_versions: &RangeInclusiveSet<CrsqlDbVersion>,
-        expected: Vec<CrsqlDbVersionRange>,
-    ) -> rusqlite::Result<()> {
-        let gaps: Vec<(ActorId, CrsqlDbVersion, CrsqlDbVersion)> = conn
-            .prepare_cached("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        assert_eq!(
-            gaps,
-            expected
-                .clone()
-                .into_iter()
-                .map(|expected| (bv.actor_id, expected.start(), expected.end()))
-                .collect::<Vec<_>>()
-        );
-
-        for range in all_versions.iter() {
-            assert!(bv.contains_all(range.clone(), None));
-        }
-
-        for range in expected {
-            for v in range {
-                assert!(!bv.contains(v, None), "expected not to contain {v}");
-                assert!(bv.needed.contains(&v), "expected needed to contain {v:?}");
-            }
-        }
-
-        assert_eq!(
-            bv.max,
-            all_versions.iter().next_back().map(|range| *range.end()),
-            "expected last version not to increment"
-        );
-
-        Ok(())
-    }
 }

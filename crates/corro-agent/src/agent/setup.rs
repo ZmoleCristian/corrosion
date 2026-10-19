@@ -1,25 +1,28 @@
 //! Setup main agent state
 
 // External crates
-use antithesis_sdk::assert_unreachable;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
-use indexmap::IndexMap;
-use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::json;
-use spawn::spawn_counted;
-use std::{net::SocketAddr, ops::DerefMut, sync::Arc, time::Duration};
+use std::{
+    io::{self, Read, Seek, SeekFrom},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{
         mpsc::{channel as tokio_channel, Receiver as TokioReceiver},
         RwLock as TokioRwLock, Semaphore,
     },
+    time::Instant,
 };
-use tracing::{debug, error, info, trace, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
+use zstd;
 
 // Internals
 use crate::{
@@ -34,14 +37,17 @@ use crate::{
 };
 use corro_types::{
     actor::ActorId,
-    agent::{
-        migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
+    agent::{migrate, Agent, AgentConfig, ApplyTrigger, BookedVersions, Bookie, SplitPool},
+    base::CrsqlDbVersionRange,
+    broadcast::{
+        BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeInput,
+        PlumtreeUpdates,
     },
-    base::{CrsqlDbVersion, CrsqlDbVersionRange},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
-    config::Config,
+    compress::ZstdDicts,
+    config::{CompressionConfig, Config},
     members::Members,
+    metrics_tracker::MetricsTracker,
     pubsub::{Matcher, SubsManager},
     schema::{init_schema, Schema},
     sqlite::CrConn,
@@ -50,15 +56,17 @@ use corro_types::{
 
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
-    pub lock_registry: LockRegistry,
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listeners: Vec<TcpListener>,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
-    pub rx_apply: CorroReceiver<(ActorId, CrsqlDbVersion)>,
+    pub rx_apply: CorroReceiver<ApplyTrigger>,
     pub rx_clear_buf: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
-    pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
+    pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     pub rx_foca: CorroReceiver<FocaInput>,
+    // pub tx_plumtree: CorroSender<PlumtreeInput>,
+    pub rx_plumtree: CorroReceiver<PlumtreeInput>,
+    pub rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
     pub rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
     pub subs_manager: SubsManager,
     pub subs_bcast_cache: SharedMatcherBroadcastCache,
@@ -111,7 +119,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let write_sema = Arc::new(Semaphore::new(1));
 
-    let pool = SplitPool::create(&conf.db.path, write_sema.clone()).await?;
+    let pool = SplitPool::create(&conf.db.path, write_sema.clone(), conf.db.cache_size_kib).await?;
 
     let clock = Arc::new(
         uhlc::HLCBuilder::default()
@@ -166,8 +174,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let external_addr = conf.gossip.external_addr;
 
     // RTT handling interacts with the tokio ReceiverStream and as
-    // such needs a raw tokio channel
-    let (rtt_tx, rtt_rx) = tokio_channel(128);
+    let (rtt_tx, rtt_rx) = tokio_channel(1024);
 
     let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
@@ -180,98 +187,36 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_bcast, rx_bcast) = bounded(conf.perf.bcast_channel_len, "bcast");
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
+    let (tx_plumtree, rx_plumtree) = bounded(conf.perf.bcast_channel_len, "plumtree");
+    let (tx_plumtree_updates, rx_plumtree_updates) =
+        bounded(conf.perf.foca_channel_len, "plumtree_updates");
 
-    let lock_registry = LockRegistry::default();
+    // Load all actors' bookie state synchronously.
+    let start = Instant::now();
+    let all_booked = {
+        let conn = pool.read().await?;
+        BookedVersions::load_all_from_conn(&conn)?
+    };
+    info!("Loaded booked versions in {:?}", start.elapsed());
 
-    // make an empty booked!
-    let booked = Booked::new(BookedVersions::new(actor_id), lock_registry.clone());
+    let bookie = Bookie::new(all_booked);
+    let booked = bookie.ensure(actor_id);
 
-    // asynchronously load it up!
-    tokio::spawn({
-        let pool = pool.clone();
-        // acquiring the lock here means everything will have to wait for it to be ready
-        let mut booked = booked.write_owned::<&str, _>("init", None).await;
-        async move {
-            let conn = pool.read().await?;
-            *booked.deref_mut().deref_mut() =
-                tokio::task::block_in_place(|| BookedVersions::from_conn(&conn, actor_id))
-                    .expect("loading BookedVersions from db failed");
-            Ok::<_, eyre::Report>(())
-        }
-    });
+    let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
 
-    spawn_counted({
-        let registry = lock_registry.clone();
-        let mut tripwire = tripwire.clone();
-        async move {
-            const WARNING_THRESHOLD: Duration = Duration::from_secs(10);
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = &mut tripwire => {
-                        return;
-                    }
-                }
-                trace!("inspecting the lock registry...");
-
-                let top: IndexMap<_, _> = {
-                    registry
-                        .map
-                        .read()
-                        .iter()
-                        .take(10) // this is an ordered map, so taking the first few is gonna be the highest values
-                        .map(|(k, v)| (*k, v.clone()))
-                        .collect()
-                };
-
-                if top.values().any(|meta| {
-                    let duration = meta.started_at.elapsed();
-                    duration >= WARNING_THRESHOLD
-                }) {
-                    warn!(
-                        "lock registry shows locks held for a long time! top {} locks:",
-                        top.len()
-                    );
-
-                    for (id, lock) in top {
-                        let duration = lock.started_at.elapsed();
-                        warn!(
-                            "{} (id: {id}, type: {:?}, state: {:?}) locked for: {duration:?}",
-                            lock.label, lock.kind, lock.state
-                        );
-
-                        if matches!(lock.state, LockState::Locked) {
-                            let details = json!({
-                                "duration": duration,
-                                "label": lock.label,
-                                "kind": lock.kind,
-                                "state": lock.state,
-                            });
-                            assert_unreachable!("bookie lock held for too long", &details);
-                        }
-
-                        if duration >= WARNING_THRESHOLD {
-                            counter!("corro.agent.lock.slow.count", "name" => lock.label)
-                                .increment(1);
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let change_dict = load_change_dicts(&conf.gossip.compression_config())?;
 
     let opts = AgentOptions {
         gossip_server_endpoint,
         transport: transport.clone(),
         api_listeners,
-        lock_registry,
         rx_bcast,
         rx_apply,
         rx_clear_buf,
         rx_changes,
         rx_foca,
+        rx_plumtree,
+        rx_plumtree_updates,
         rtt_rx,
         subs_manager: subs_manager.clone(),
         subs_bcast_cache,
@@ -281,7 +226,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let agent = Agent::new(AgentConfig {
         actor_id,
-        pool,
+        pool: pool.clone(),
         gossip_addr,
         external_addr,
         api_addr,
@@ -289,20 +234,109 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         config: ArcSwap::from_pointee(conf),
         clock,
         booked,
+        bookie,
         tx_bcast,
         tx_apply,
         tx_clear_buf,
         tx_changes,
         tx_foca,
+        tx_plumtree,
+        tx_plumtree_updates,
+        change_dict,
         write_sema,
         schema: RwLock::new(schema),
         cluster_id,
         subs_manager,
         updates_manager,
+        metrics_tracker,
         tripwire,
+        fatal_issue: Default::default(),
+        shutdown_token: CancellationToken::new(),
     });
 
     Ok((agent, opts))
+}
+
+/// Load trained zstd dictionaries from `gossip.compression.dict_dir`.
+///
+/// Every valid dictionary file in the directory is registered for decoding.
+/// When `dict_file` is set, that file is also used as the encoder dictionary.
+pub fn load_change_dicts(
+    compression_config: &CompressionConfig,
+) -> eyre::Result<Option<Arc<ZstdDicts>>> {
+    let Some(dir) = &compression_config.dict_dir else {
+        return Ok(None);
+    };
+
+    let encode_name = compression_config.dict_file.as_deref();
+    let mut encoder_bytes: Option<Vec<u8>> = None;
+    let mut decoder_dicts = Vec::new();
+
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| eyre::eyre!("could not read compression dict dir {dir}: {e}"))?;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let entry_path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+
+        let mut file = match std::fs::File::open(&entry_path) {
+            Ok(file) => file,
+            Err(e) => {
+                warn!("could not open candidate compression dict {entry_path:?}: {e}");
+                continue;
+            }
+        };
+
+        match load_dictionary(&mut file) {
+            Ok(Some(b)) => {
+                if encode_name == Some(file_name.as_ref()) {
+                    info!(
+                        path = %entry_path.display(),
+                        dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
+                        "using compression dictionary for encoding and decoding"
+                    );
+                    encoder_bytes = Some(b.clone());
+                } else {
+                    info!(
+                        path = %entry_path.display(),
+                        dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
+                        "using compression dictionary for decoding"
+                    );
+                }
+                decoder_dicts.push(b);
+            }
+            _ => {
+                warn!("could not read candidate compression dict {entry_path:?}");
+            }
+        }
+    }
+
+    if let Some(name) = encode_name {
+        if encoder_bytes.is_none() {
+            eyre::bail!(
+                "gossip.compression.dict_file `{name}` not found in {dir} \
+                 or is not a valid zstd dictionary"
+            );
+        }
+    }
+
+    Ok(Some(Arc::new(ZstdDicts::new(
+        encoder_bytes.as_deref(),
+        compression_config.level,
+        decoder_dicts,
+    ))))
+}
+
+/// Rescan `gossip.compression.dict_dir` and swap the agent's dictionaries.
+pub fn reload_change_dicts(agent: &Agent) -> eyre::Result<usize> {
+    let dicts = load_change_dicts(&agent.config().gossip.compression_config())?;
+    let decoder_count = dicts.as_ref().map(|d| d.decoder_count()).unwrap_or(0);
+    agent.set_change_dict(dicts);
+    Ok(decoder_count)
 }
 
 /// Initialise subscription state and tasks
@@ -432,4 +466,17 @@ mod tests {
 
         Ok(())
     }
+}
+
+fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0u8; 4];
+    let peeked = file.read(&mut prefix)?;
+    let is_dict = peeked == 4 && u32::from_le_bytes(prefix) == zstd::zstd_safe::MAGIC_DICTIONARY;
+    if !is_dict {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }

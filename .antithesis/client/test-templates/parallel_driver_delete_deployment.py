@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
+from antithesis.random import AntithesisRandom
 import argparse
-import random
 import subprocess
 import threading
 
@@ -9,18 +9,21 @@ sys.path.append("/opt/antithesis/py-resources")
 import helper
 
 
-random = random.SystemRandom()
+random = AntithesisRandom()
 
 def do_deletes(address):
+    id = helper.get_random_cols(address, "deployments", ["id"]) 
+    if id is None:
+        print(f"No deployment found for {address}")
+        return
+
+    deploy_id = id[0]
     try:
-        id = helper.get_random_cols(address, "deployments", ["id"]) 
         host, port = address.split(':')
         conn = helper.get_db_connection(host, "5470")
-        if id is not None:
-            id = id[0]
-            helper.execute_psql(conn, f"DELETE FROM deployments WHERE id = {id}")
+        helper.execute_psql(conn, f"DELETE FROM deployments WHERE id = {deploy_id}")
     except Exception as e:
-        print(f"Error deleting team {id}: {e}")
+        print(f"Error deleting deployment {deploy_id}: {e}")
         return
 
 

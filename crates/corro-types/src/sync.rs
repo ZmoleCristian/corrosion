@@ -1,18 +1,20 @@
 use std::{cmp, collections::HashMap, io, ops::RangeInclusive};
 
 use bytes::BytesMut;
+use metrics::counter;
 use opentelemetry::propagation::{Extractor, Injector};
 use rangemap::RangeInclusiveSet;
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use tokio_util::codec::{Decoder, LengthDelimitedCodec};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     actor::ActorId,
-    agent::{Booked, Bookie},
+    agent::Bookie,
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     broadcast::{ChangeV1, Timestamp},
+    compress::{decompress_change, try_compress_change_for_wire, CompressError, WireCompression},
 };
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -27,6 +29,9 @@ pub enum SyncMessageV1 {
     Clock(Timestamp),
     Rejection(SyncRejectionV1),
     Request(SyncRequestV1),
+    // zstd-compressed, speedy-encoded ChangeV1 -- only ever sent to peers that
+    // advertised support for it via BiPayload::V1::supports_compression
+    CompressedChangeset(Vec<u8>),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
@@ -76,7 +81,7 @@ pub enum SyncRejectionV1 {
     DifferentCluster,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Readable, Writable, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Writable, Serialize, Deserialize)]
 pub struct SyncStateV1 {
     pub actor_id: ActorId,
     pub heads: HashMap<ActorId, CrsqlDbVersion>,
@@ -86,7 +91,97 @@ pub struct SyncStateV1 {
     pub last_cleared_ts: Option<Timestamp>,
 }
 
+// Keep the generated wire decoder separate from the validated public type. The
+// wire layout is identical to `SyncStateV1`, but conversion into the public
+// type only succeeds after every inclusive range has been checked.
+#[derive(Readable)]
+struct UnvalidatedSyncStateV1 {
+    actor_id: ActorId,
+    heads: HashMap<ActorId, CrsqlDbVersion>,
+    need: HashMap<ActorId, Vec<RangeInclusive<CrsqlDbVersion>>>,
+    partial_need: HashMap<ActorId, HashMap<CrsqlDbVersion, Vec<RangeInclusive<CrsqlSeq>>>>,
+    #[speedy(default_on_eof)]
+    last_cleared_ts: Option<Timestamp>,
+}
+
+impl<'a, C> Readable<'a, C> for SyncStateV1
+where
+    C: speedy::Context,
+{
+    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        let state = UnvalidatedSyncStateV1::read_from(reader)?;
+        let state = Self {
+            actor_id: state.actor_id,
+            heads: state.heads,
+            need: state.need,
+            partial_need: state.partial_need,
+            last_cleared_ts: state.last_cleared_ts,
+        };
+
+        state
+            .validate()
+            .map_err(|error| speedy::Error::custom(error.to_string()))?;
+
+        Ok(state)
+    }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        <UnvalidatedSyncStateV1 as Readable<'a, C>>::minimum_bytes_needed()
+    }
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum SyncStateValidationError {
+    #[error("invalid need range for actor {actor_id}: start {start} is greater than end {end}")]
+    InvertedNeed {
+        actor_id: ActorId,
+        start: CrsqlDbVersion,
+        end: CrsqlDbVersion,
+    },
+    #[error(
+        "invalid partial need range for actor {actor_id} at version {version}: start {start} is greater than end {end}"
+    )]
+    InvertedPartialNeed {
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        start: CrsqlSeq,
+        end: CrsqlSeq,
+    },
+}
+
 impl SyncStateV1 {
+    pub fn validate(&self) -> Result<(), SyncStateValidationError> {
+        for (actor_id, ranges) in &self.need {
+            for range in ranges {
+                if range.start() > range.end() {
+                    return Err(SyncStateValidationError::InvertedNeed {
+                        actor_id: *actor_id,
+                        start: *range.start(),
+                        end: *range.end(),
+                    });
+                }
+            }
+        }
+
+        for (actor_id, partials) in &self.partial_need {
+            for (version, ranges) in partials {
+                for range in ranges {
+                    if range.start() > range.end() {
+                        return Err(SyncStateValidationError::InvertedPartialNeed {
+                            actor_id: *actor_id,
+                            version: *version,
+                            start: *range.start(),
+                            end: *range.end(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn need_len(&self) -> u64 {
         self.need
             .values()
@@ -127,7 +222,10 @@ impl SyncStateV1 {
     pub fn compute_available_needs(
         &self,
         other: &SyncStateV1,
-    ) -> HashMap<ActorId, Vec<SyncNeedV1>> {
+    ) -> Result<HashMap<ActorId, Vec<SyncNeedV1>>, SyncStateValidationError> {
+        self.validate()?;
+        other.validate()?;
+
         let mut needs: HashMap<ActorId, Vec<SyncNeedV1>> = HashMap::new();
 
         for (actor_id, head) in other.heads.iter() {
@@ -241,11 +339,11 @@ impl SyncStateV1 {
             }
         }
 
-        needs
+        Ok(needs)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Writable)]
 pub enum SyncNeedV1 {
     Full {
         versions: CrsqlDbVersionRange,
@@ -259,7 +357,85 @@ pub enum SyncNeedV1 {
     },
 }
 
+#[derive(Readable)]
+enum UnvalidatedSyncNeedV1 {
+    Full {
+        versions: CrsqlDbVersionRange,
+    },
+    Partial {
+        version: CrsqlDbVersion,
+        seqs: Vec<CrsqlSeqRange>,
+    },
+    Empty {
+        ts: Option<Timestamp>,
+    },
+}
+
+impl<'a, C> Readable<'a, C> for SyncNeedV1
+where
+    C: speedy::Context,
+{
+    fn read_from<R: speedy::Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        let need = match UnvalidatedSyncNeedV1::read_from(reader)? {
+            UnvalidatedSyncNeedV1::Full { versions } => Self::Full { versions },
+            UnvalidatedSyncNeedV1::Partial { version, seqs } => Self::Partial { version, seqs },
+            UnvalidatedSyncNeedV1::Empty { ts } => Self::Empty { ts },
+        };
+
+        need.validate()
+            .map_err(|error| speedy::Error::custom(error.to_string()))?;
+
+        Ok(need)
+    }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        <UnvalidatedSyncNeedV1 as Readable<'a, C>>::minimum_bytes_needed()
+    }
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum SyncNeedValidationError {
+    #[error("invalid full sync range: start {start} is greater than end {end}")]
+    InvertedFull {
+        start: CrsqlDbVersion,
+        end: CrsqlDbVersion,
+    },
+    #[error(
+        "invalid partial sync range at version {version}: start {start} is greater than end {end}"
+    )]
+    InvertedPartial {
+        version: CrsqlDbVersion,
+        start: CrsqlSeq,
+        end: CrsqlSeq,
+    },
+}
+
 impl SyncNeedV1 {
+    pub fn validate(&self) -> Result<(), SyncNeedValidationError> {
+        match self {
+            Self::Full { versions } if versions.start() > versions.end() => {
+                Err(SyncNeedValidationError::InvertedFull {
+                    start: versions.start(),
+                    end: versions.end(),
+                })
+            }
+            Self::Partial { version, seqs } => {
+                for range in seqs {
+                    if range.start() > range.end() {
+                        return Err(SyncNeedValidationError::InvertedPartial {
+                            version: *version,
+                            start: range.start(),
+                            end: range.end(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     #[inline]
     pub fn count(&self) -> usize {
         match self {
@@ -284,17 +460,10 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
         ..Default::default()
     };
 
-    let actors: Vec<(ActorId, Booked)> = {
-        bookie
-            .read::<&str, _>("generate_sync", None)
-            .await
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
-    };
+    let guard = bookie.owned_guard();
 
-    for (actor_id, booked) in actors {
-        let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
+    for (&actor_id, booked) in bookie.iter(&guard) {
+        let bookedr = booked.read();
 
         let last_version = match bookedr.last() {
             None => continue,
@@ -345,6 +514,8 @@ pub enum SyncMessageDecodeError {
     Corrupted(u32, u32),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Compress(#[from] CompressError),
 }
 
 impl SyncMessage {
@@ -360,7 +531,35 @@ impl SyncMessage {
     }
 
     pub fn from_buf(buf: &mut BytesMut) -> Result<Self, SyncMessageDecodeError> {
-        Ok(Self::from_slice(buf)?)
+        let msg = Self::from_slice(buf)?;
+        Ok(match msg {
+            SyncMessage::V1(SyncMessageV1::CompressedChangeset(data)) => SyncMessage::V1(
+                SyncMessageV1::Changeset(decompress_change(&data, "sync", None)?),
+            ),
+            other => other,
+        })
+    }
+
+    /// Try to compress a `Changeset` message for the wire. Falls back to the
+    /// original, uncompressed message if compression fails or doesn't
+    /// actually shrink the payload. Should only be sent to peers that have
+    /// advertised support for decoding `CompressedChangeset`.
+    pub fn compress_changeset(self, level: i32) -> Self {
+        let SyncMessage::V1(SyncMessageV1::Changeset(change)) = self else {
+            return self;
+        };
+
+        match try_compress_change_for_wire(&change, "sync", level, None) {
+            Ok(WireCompression::Compressed(compressed)) => {
+                SyncMessage::V1(SyncMessageV1::CompressedChangeset(compressed))
+            }
+            Ok(WireCompression::Uncompressed) => SyncMessage::V1(SyncMessageV1::Changeset(change)),
+            Err(e) => {
+                counter!("corro.compression.errors.total", "traffic" => "sync").increment(1);
+                debug!("could not compress sync changeset, sending uncompressed: {e}");
+                SyncMessage::V1(SyncMessageV1::Changeset(change))
+            }
+        }
     }
 
     pub fn decode(
@@ -392,7 +591,7 @@ mod tests {
         other_state.heads.insert(actor1, CrsqlDbVersion(13));
 
         assert_eq!(
-            our_state.compute_available_needs(&other_state),
+            our_state.compute_available_needs(&other_state).unwrap(),
             [(
                 actor1,
                 vec![SyncNeedV1::Full {
@@ -406,7 +605,7 @@ mod tests {
         our_state.need.entry(actor1).or_default().push(dbvri!(7, 7));
 
         assert_eq!(
-            our_state.compute_available_needs(&other_state),
+            our_state.compute_available_needs(&other_state).unwrap(),
             [(
                 actor1,
                 vec![
@@ -430,7 +629,7 @@ mod tests {
         );
 
         assert_eq!(
-            our_state.compute_available_needs(&other_state),
+            our_state.compute_available_needs(&other_state).unwrap(),
             [(
                 actor1,
                 vec![
@@ -458,7 +657,7 @@ mod tests {
         );
 
         assert_eq!(
-            our_state.compute_available_needs(&other_state),
+            our_state.compute_available_needs(&other_state).unwrap(),
             [(
                 actor1,
                 vec![
@@ -479,5 +678,330 @@ mod tests {
             )]
             .into()
         );
+    }
+
+    fn change_with_rows(n: usize) -> ChangeV1 {
+        use crate::{actor::ActorId, base::CrsqlDbVersion, change::Change};
+        use corro_api_types::SqliteValue;
+
+        let actor_id = ActorId(Uuid::new_v4());
+        let changes = (0..n)
+            .map(|i| Change {
+                table: "test_table".into(),
+                pk: format!("pk-{i}").into_bytes(),
+                cid: "some_column".into(),
+                val: SqliteValue::Text("a fairly repetitive value".into()),
+                col_version: 1,
+                db_version: CrsqlDbVersion(1),
+                seq: CrsqlSeq(i as u64),
+                site_id: actor_id.to_bytes(),
+                cl: 1,
+            })
+            .collect::<Vec<_>>();
+
+        ChangeV1 {
+            actor_id,
+            changeset: crate::broadcast::Changeset::Full {
+                version: CrsqlDbVersion(1),
+                changes,
+                seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(n.max(1) as u64 - 1)),
+                last_seq: CrsqlSeq(n.max(1) as u64 - 1),
+                ts: Timestamp::zero(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_compress_changeset_roundtrips_through_wire() {
+        let change = change_with_rows(100);
+        let msg = SyncMessage::V1(SyncMessageV1::Changeset(change.clone())).compress_changeset(3);
+
+        assert!(
+            matches!(msg, SyncMessage::V1(SyncMessageV1::CompressedChangeset(_))),
+            "expected a large, repetitive changeset to compress"
+        );
+
+        let mut buf = BytesMut::from(msg.write_to_vec().unwrap().as_slice());
+        let decoded = SyncMessage::from_buf(&mut buf).unwrap();
+
+        assert_eq!(decoded, SyncMessage::V1(SyncMessageV1::Changeset(change)));
+    }
+}
+
+#[cfg(test)]
+mod wire_range_validation_tests {
+    use super::*;
+    use crate::{
+        base::{dbsr, dbsri, dbvr, dbvri, CrsqlSeqRange},
+        broadcast::{BroadcastV1, ChangeValidationError, Changeset, ChangesetPerTable},
+    };
+    use rangemap::RangeInclusiveSet;
+    use speedy::{Readable, Writable};
+    use uuid::Uuid;
+
+    fn actor() -> ActorId {
+        ActorId(Uuid::from_u128(1))
+    }
+
+    fn assert_wire_rejects(message: SyncMessage, expected: &str) {
+        let bytes = message.write_to_vec().unwrap();
+        let error = SyncMessage::read_from_buffer(&bytes).unwrap_err();
+
+        assert!(
+            error.to_string().contains(expected),
+            "unexpected decode error: {error}"
+        );
+    }
+
+    fn assert_wire_roundtrip(message: SyncMessage) {
+        let bytes = message.write_to_vec().unwrap();
+        assert_eq!(SyncMessage::read_from_buffer(&bytes).unwrap(), message);
+    }
+
+    fn request(need: SyncNeedV1) -> SyncMessage {
+        SyncMessage::V1(SyncMessageV1::Request(vec![(actor(), vec![need])]))
+    }
+
+    #[test]
+    fn wire_decode_rejects_inverted_need_range() {
+        let target = actor();
+        let mut state = SyncStateV1::default();
+        state.heads.insert(target, CrsqlDbVersion(20));
+        state.need.insert(target, vec![dbvri!(10, 5)]);
+
+        assert_wire_rejects(
+            SyncMessage::V1(SyncMessageV1::State(state)),
+            "invalid need range for actor",
+        );
+    }
+
+    #[test]
+    fn wire_decode_rejects_inverted_partial_need_range() {
+        let target = actor();
+        let mut state = SyncStateV1::default();
+        state.heads.insert(target, CrsqlDbVersion(20));
+        state
+            .partial_need
+            .insert(target, [(CrsqlDbVersion(11), vec![dbsri!(60, 50)])].into());
+
+        assert_wire_rejects(
+            SyncMessage::V1(SyncMessageV1::State(state)),
+            "invalid partial need range for actor",
+        );
+    }
+
+    #[test]
+    fn wire_decode_accepts_valid_need_and_partial_ranges() {
+        let target = actor();
+        let mut state = SyncStateV1::default();
+        state.heads.insert(target, CrsqlDbVersion(20));
+        state.need.insert(target, vec![dbvri!(5, 10)]);
+        state
+            .partial_need
+            .insert(target, [(CrsqlDbVersion(11), vec![dbsri!(50, 60)])].into());
+
+        assert_wire_roundtrip(SyncMessage::V1(SyncMessageV1::State(state)));
+    }
+
+    #[test]
+    fn compute_available_needs_returns_error_on_inverted_need() {
+        let target = actor();
+        let our = SyncStateV1::default();
+        let mut theirs = SyncStateV1::default();
+        theirs.heads.insert(target, CrsqlDbVersion(20));
+        theirs.need.insert(target, vec![dbvri!(10, 5)]);
+
+        assert_eq!(
+            our.compute_available_needs(&theirs).unwrap_err(),
+            SyncStateValidationError::InvertedNeed {
+                actor_id: target,
+                start: CrsqlDbVersion(10),
+                end: CrsqlDbVersion(5),
+            }
+        );
+    }
+
+    #[test]
+    fn compute_available_needs_returns_error_on_inverted_partial_need() {
+        let target = actor();
+        let mut our = SyncStateV1::default();
+        our.partial_need
+            .insert(target, [(CrsqlDbVersion(9), vec![dbsri!(100, 120)])].into());
+
+        let mut theirs = SyncStateV1::default();
+        theirs.heads.insert(target, CrsqlDbVersion(20));
+        theirs
+            .partial_need
+            .insert(target, [(CrsqlDbVersion(9), vec![dbsri!(50, 10)])].into());
+
+        assert_eq!(
+            our.compute_available_needs(&theirs).unwrap_err(),
+            SyncStateValidationError::InvertedPartialNeed {
+                actor_id: target,
+                version: CrsqlDbVersion(9),
+                start: CrsqlSeq(50),
+                end: CrsqlSeq(10),
+            }
+        );
+    }
+
+    #[test]
+    fn compute_available_needs_accepts_valid_ranges() {
+        let target = actor();
+        let mut our = SyncStateV1::default();
+        our.need.insert(target, vec![dbvri!(5, 10)]);
+        let mut theirs = SyncStateV1::default();
+        theirs.heads.insert(target, CrsqlDbVersion(20));
+
+        assert!(our.compute_available_needs(&theirs).is_ok());
+    }
+
+    #[test]
+    fn wire_decode_rejects_inverted_full_sync_request() {
+        assert_wire_rejects(
+            request(SyncNeedV1::Full {
+                versions: dbvr!(10, 5),
+            }),
+            "invalid full sync range",
+        );
+    }
+
+    #[test]
+    fn wire_decode_rejects_inverted_partial_sync_request() {
+        assert_wire_rejects(
+            request(SyncNeedV1::Partial {
+                version: CrsqlDbVersion(10),
+                seqs: vec![dbsr!(10, 5)],
+            }),
+            "invalid partial sync range",
+        );
+    }
+
+    #[test]
+    fn wire_decode_accepts_valid_sync_request_ranges() {
+        let message = SyncMessage::V1(SyncMessageV1::Request(vec![(
+            actor(),
+            vec![
+                SyncNeedV1::Full {
+                    versions: dbvr!(5, 10),
+                },
+                SyncNeedV1::Partial {
+                    version: CrsqlDbVersion(11),
+                    seqs: vec![dbsr!(50, 60)],
+                },
+            ],
+        )]));
+
+        assert_wire_roundtrip(message);
+    }
+
+    fn full_v2_change(seqs: CrsqlSeqRange) -> ChangeV1 {
+        let actor_id = actor();
+        ChangeV1 {
+            actor_id,
+            changeset: Changeset::FullV2 {
+                actor_id,
+                version: CrsqlDbVersion(7),
+                changes: ChangesetPerTable::default(),
+                seqs,
+                last_seq: CrsqlSeq(20),
+                ts: Timestamp::zero(),
+            },
+        }
+    }
+
+    fn decode_sync_change(change: ChangeV1) -> Result<ChangeV1, String> {
+        let bytes = SyncMessage::V1(SyncMessageV1::Changeset(change))
+            .write_to_vec()
+            .unwrap();
+        match SyncMessage::read_from_buffer(&bytes).map_err(|error| error.to_string())? {
+            SyncMessage::V1(SyncMessageV1::Changeset(change)) => Ok(change),
+            message => Err(format!("expected a changeset, got {message:?}")),
+        }
+    }
+
+    fn decode_broadcast_change(change: ChangeV1) -> Result<ChangeV1, String> {
+        let bytes = BroadcastV1::Change(change).write_to_vec().unwrap();
+        BroadcastV1::read_from_buffer(&bytes)
+            .map_err(|error| error.to_string())?
+            .into_change(None)
+            .map_err(|error| error.to_string())
+    }
+
+    fn assert_decode_error(result: Result<ChangeV1, String>, expected: &str) {
+        let error = result.unwrap_err();
+        assert!(error.contains(expected), "unexpected decode error: {error}");
+    }
+
+    fn assert_invalid_versions(changeset: Changeset) {
+        let change = ChangeV1 {
+            actor_id: actor(),
+            changeset,
+        };
+
+        assert_eq!(
+            change.validate().unwrap_err(),
+            ChangeValidationError::InvertedVersions {
+                start: CrsqlDbVersion(10),
+                end: CrsqlDbVersion(5),
+            }
+        );
+        assert_decode_error(
+            decode_broadcast_change(change),
+            "invalid changeset version range",
+        );
+    }
+
+    #[test]
+    fn wire_decode_rejects_inverted_empty_changeset_versions() {
+        assert_invalid_versions(Changeset::Empty {
+            versions: dbvr!(10, 5),
+            ts: None,
+        });
+    }
+
+    #[test]
+    fn wire_decode_rejects_inverted_empty_set_changeset_versions() {
+        assert_invalid_versions(Changeset::EmptySet {
+            versions: vec![dbvr!(10, 5)],
+            ts: Timestamp::zero(),
+        });
+    }
+
+    #[test]
+    fn wire_decode_rejects_inverted_changeset_seqs() {
+        let change = full_v2_change(dbsr!(10, 5));
+
+        assert_eq!(
+            change.validate().unwrap_err(),
+            ChangeValidationError::InvertedSeqs {
+                start: CrsqlSeq(10),
+                end: CrsqlSeq(5),
+            }
+        );
+
+        assert_decode_error(
+            decode_sync_change(change.clone()),
+            "invalid changeset sequence range",
+        );
+        assert_decode_error(
+            decode_broadcast_change(change),
+            "invalid changeset sequence range",
+        );
+    }
+
+    #[test]
+    fn wire_decode_accepts_valid_changeset_seqs_for_seen_cache() {
+        let change = full_v2_change(dbsr!(5, 10));
+        let decoded = decode_sync_change(change.clone()).unwrap();
+
+        let seqs = decoded.seqs().unwrap();
+        let mut entry: RangeInclusiveSet<CrsqlSeq> = RangeInclusiveSet::new();
+        entry.extend([seqs.into()]);
+        assert!(entry.contains(&CrsqlSeq(5)));
+        assert!(entry.contains(&CrsqlSeq(10)));
+
+        let decoded = decode_broadcast_change(change).unwrap();
+        assert_eq!(decoded.seqs(), Some(dbsr!(5, 10)));
     }
 }

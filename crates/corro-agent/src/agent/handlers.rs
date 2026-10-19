@@ -18,15 +18,17 @@ use crate::{
     api::peer::parallel_sync,
     transport::Transport,
 };
-use antithesis_sdk::assert_sometimes;
+use antithesis_sdk::{assert_always, assert_sometimes};
 use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeUpdates},
     channel::CorroReceiver,
+    config::BroadcastMethod,
     members::MemberAddedResult,
+    sqlite::log_slow_inflight_queries,
     sync::generate_sync,
 };
 
@@ -38,11 +40,12 @@ use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
+use serde_json::json;
 use spawn::spawn_counted;
-use tokio::time::sleep;
+use tokio::time::{sleep, MissedTickBehavior};
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
-    task::{block_in_place, JoinSet},
+    task::{block_in_place, JoinHandle},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
@@ -131,13 +134,35 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(
-            &tripwire,
-            &conn,
-            agent.cluster_id(),
-            agent.tx_changes().clone(),
-        );
+        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
+    });
+}
+
+const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Spawn a task that samples the RTT of every live connection on a fixed
+/// interval, so that sample rate is independent of traffic volume.
+pub fn spawn_rtt_sampler(transport: &Transport, tripwire: Tripwire) {
+    spawn_counted({
+        let transport = transport.clone();
+        let mut tripwire = tripwire.clone();
+        async move {
+            let mut interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        transport.sample_rtts().await;
+                    }
+                }
+            }
+            info!("rtt_sampler is done");
+        }
     });
 }
 
@@ -167,6 +192,7 @@ pub fn spawn_rtt_handler(
                             let mut members = agent.members().write();
                             for (addr, rtt) in chunks {
                                 members.add_rtt(addr, rtt);
+                                histogram!("corro.transport.rtt.v2.seconds").record(rtt.as_secs_f64());
                             }
                         } else {
                             break;
@@ -231,6 +257,8 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
             let timer = tokio::time::sleep(Duration::new(0, 0));
             tokio::pin!(timer);
 
+            let allow_mixed_ip = agent.config().gossip.allow_mixed_ip;
+
             loop {
                 tokio::select! {
                     _ = &mut tripwire => {
@@ -243,6 +271,7 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
                     gossip_addr,
+                    allow_mixed_ip,
                     agent.pool(),
                 )
                 .await
@@ -297,9 +326,9 @@ pub async fn handle_gossip_to_send(
                     error!("could not write datagram {addr}: {e}");
                     return;
                 }
-                counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string())
-                    .increment(1);
-                counter!("corro.peer.datagram.bytes.sent.total").increment(len as u64);
+                counter!("corro.peer.datagram.sent.total", "traffic" => "foca").increment(1);
+                counter!("corro.peer.datagram.bytes.sent.total", "traffic" => "foca")
+                    .increment(len as u64);
             }
             .instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)),
         );
@@ -335,13 +364,18 @@ pub async fn handle_notifications(
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
-                    MemberAddedResult::NewMember | MemberAddedResult::Removed => {
+                    MemberAddedResult::NewMember(_) | MemberAddedResult::Removed => {
                         if matches!(member_added_res, MemberAddedResult::Removed) {
                             debug!("Member Removed {actor:?} due to member id mismatch");
-                            counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                            counter!(
+                                "corro.gossip.member.removed",
+                                "traffic" => "foca",
+                                "kind" => "member_id_mismatch"
+                            )
+                            .increment(1);
                         } else {
                             debug!("Member Added {actor:?}");
-                            counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                            counter!("corro.gossip.member.added", "traffic" => "foca").increment(1);
                         }
 
                         let members_len = { agent.members().read().states.len() as u32 };
@@ -354,8 +388,10 @@ pub async fn handle_notifications(
                                 error!("could not send new foca cluster size: {e}");
                             }
                         }
+
+                        send_plumtree_member_update(&agent, &actor, member_added_res).await;
                     }
-                    MemberAddedResult::Updated => {
+                    MemberAddedResult::Updated(_) => {
                         debug!("Member Updated {actor:?}");
                         // anything else to do here?
                     }
@@ -384,7 +420,8 @@ pub async fn handle_notifications(
                 info!("Member Down {actor:?} (removed: {removed})");
                 if removed {
                     debug!("Member Down {actor:?}");
-                    counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                    counter!("corro.gossip.member.removed", "traffic" => "foca", "kind" => "member_down")
+                        .increment(1);
                     // actually removed a member
                     // notify of new cluster size
                     let member_len = { agent.members().read().states.len() as u32 };
@@ -393,14 +430,33 @@ pub async fn handle_notifications(
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
+
+                    send_plumtree_member_update(&agent, &actor, MemberAddedResult::Removed).await;
                 }
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
             OwnedNotification::Rename(a, b) => {
-                let mut lock = agent.members().write();
-                let del_res = lock.remove_member(&a);
-                let add_res = lock.add_member(&b);
-                info!("Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})");
+                let (del_res, add_res) = {
+                    let mut lock = agent.members().write();
+                    let del_res = lock.remove_member(&a);
+                    let add_res = lock.add_member(&b);
+                    info!(
+                        "Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})"
+                    );
+                    (del_res, add_res)
+                };
+
+                // we've just re-inserted the same id, no plumtree updates needed
+                if a.id() == b.id() && del_res && matches!(add_res, MemberAddedResult::NewMember(_))
+                {
+                    continue;
+                }
+
+                if del_res {
+                    send_plumtree_member_update(&agent, &a, MemberAddedResult::Removed).await;
+                }
+
+                send_plumtree_member_update(&agent, &b, add_res).await;
             }
             OwnedNotification::Active => {
                 info!("Current node is considered ACTIVE");
@@ -423,6 +479,34 @@ pub async fn handle_notifications(
     }
 }
 
+async fn send_plumtree_member_update(agent: &Agent, actor: &Actor, result: MemberAddedResult) {
+    if agent.broadcast_method() != BroadcastMethod::Plumtree {
+        return;
+    }
+
+    let update = {
+        match result {
+            MemberAddedResult::Removed => Some(PlumtreeUpdates::MemberDown(actor.id())),
+            MemberAddedResult::NewMember(state) | MemberAddedResult::Updated(state) => {
+                Some(PlumtreeUpdates::MemberUp {
+                    actor_id: actor.id(),
+                    addr: state.addr,
+                    ring: state.ring,
+                    // rtt_ms: members.min_rtt_ms(&actor.id()).unwrap_or(u64::MAX),
+                })
+            }
+            MemberAddedResult::Ignored => None,
+        }
+    };
+
+    if let Some(update) = update {
+        // plumtree periodically checks member state so it is fine if this is best effort
+        if let Err(e) = agent.tx_plumtree_updates().try_send(update) {
+            error!("could not forward plumtree update: {e}");
+        }
+    }
+}
+
 /// We keep a write-ahead-log, which under write-pressure can grow to
 /// multiple gigabytes and needs periodic truncation.  We don't want
 /// to schedule this task too often since it locks the whole DB.
@@ -438,6 +522,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
     let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
     if busy {
         warn!("could not truncate sqlite WAL, database busy - with timeout: {timeout}");
+        log_slow_inflight_queries();
         counter!("corro.db.wal.truncate.busy").increment(1);
     } else {
         debug!("successfully truncated sqlite WAL!");
@@ -523,12 +608,10 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
 
     let pool = agent.pool().clone();
 
+    let on_antithesis = std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok();
+
     // reduce interval if we are running in antithesis
-    let interval_minutes = if std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok() {
-        1
-    } else {
-        5
-    };
+    let interval_secs = if on_antithesis { 30 } else { 5 * 60 };
 
     tokio::spawn(async move {
         let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
@@ -546,9 +629,12 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
         }
 
         // large sleep right at the start to give node time to sync
-        sleep(Duration::from_secs(60)).await;
 
-        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * interval_minutes));
+        if !on_antithesis {
+            sleep(Duration::from_secs(60)).await;
+        }
+
+        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
         const MAX_DB_FREE_PAGES: u64 = 10000;
 
@@ -576,6 +662,12 @@ async fn wal_checkpoint_over_threshold(
     let wal_size = wal_path.metadata()?.len();
     let should_truncate = wal_size > threshold;
 
+    let details = json!({
+        "wal_size": wal_size,
+        "threshold": threshold,
+        "should_truncate": should_truncate,
+    });
+    assert_sometimes!(true, "Corrosion attempts to truncate WAL", &details);
     if should_truncate {
         let conn = if wal_size > (5 * threshold) {
             warn!("wal_size is over 5x the threshold, trying to get a priority conn");
@@ -610,6 +702,291 @@ fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
     timeout
 }
 
+/// State for dynamic batch processing
+struct HandleChangesState {
+    queue: VecDeque<(ChangeV1, ChangeSource, Instant)>,
+    buf_cost: usize,
+    current_batch_size: usize,
+    processing_task: Option<JoinHandle<Result<(), corro_types::agent::ChangeError>>>,
+    max_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    drop_log_count: u64,
+
+    /// When emergency halving last occurred; prevents batch size re-inflation
+    /// during the grace period to avoid oscillation (halve → burst → halve …)
+    halved_at: Option<Instant>,
+
+    // Configuration
+    max_queue_len: usize,
+    min_batch_size: usize,
+    step_base: usize,
+    max_batch_size: usize,
+    batch_threshold_ratio: f64,
+    timeout_duration: Duration,
+    tx_timeout: Duration,
+}
+
+impl HandleChangesState {
+    fn new(
+        min_batch_size: usize,
+        step_base: usize,
+        max_batch_size: usize,
+        batch_threshold_ratio: f64,
+        timeout_duration: Duration,
+        tx_timeout: Duration,
+        max_queue_len: usize,
+    ) -> Self {
+        Self {
+            queue: VecDeque::with_capacity(max_queue_len),
+            buf_cost: 0,
+            current_batch_size: min_batch_size,
+            processing_task: None,
+            max_wait: Some(Box::pin(tokio::time::sleep(timeout_duration))),
+            halved_at: None,
+            min_batch_size,
+            step_base,
+            max_batch_size,
+            batch_threshold_ratio,
+            timeout_duration,
+            tx_timeout,
+            max_queue_len,
+            drop_log_count: 0,
+        }
+    }
+
+    /// Duration after emergency halving during which batch size increases are blocked.
+    /// Uses the transaction timeout as a reasonable proxy for "one full processing cycle".
+    fn grace_period(&self) -> Duration {
+        self.tx_timeout
+    }
+
+    /// Whether we're still in the grace period after an emergency halving.
+    fn in_grace_period(&self) -> bool {
+        self.halved_at
+            .is_some_and(|t| t.elapsed() < self.grace_period())
+    }
+
+    /// Calculate exponential batch size based on cost.
+    /// During the grace period after emergency halving, the result is clamped
+    /// to `current_batch_size` to prevent re-inflation and oscillation.
+    fn calculate_batch_size(&self, cost: usize) -> usize {
+        let computed = if self.step_base == 0 || cost < self.step_base {
+            self.min_batch_size
+        } else {
+            let size = self.step_base * (1 << (cost / self.step_base).ilog2());
+            size.clamp(self.min_batch_size, self.max_batch_size)
+        };
+        if self.in_grace_period() {
+            computed.min(self.current_batch_size)
+        } else {
+            computed
+        }
+    }
+
+    /// Get the threshold for immediate spawning based on configured ratio
+    fn batch_threshold(&self) -> usize {
+        (self.current_batch_size as f64 * self.batch_threshold_ratio) as usize
+    }
+
+    /// Drain a batch from the queue and spawn processing task
+    fn drain_and_spawn(
+        &mut self,
+        agent: &Agent,
+        bookie: &Bookie,
+        target_size: usize,
+        reason: &str,
+    ) -> Option<usize> {
+        // Must complete previous task before spawning a new one
+        if self.processing_task.is_some() {
+            return None;
+        }
+
+        let mut batch = Vec::with_capacity(self.current_batch_size);
+        let mut batch_cost = 0;
+
+        while let Some((change, src, queued_at)) = self.queue.pop_front() {
+            let cost = change.processing_cost();
+            batch_cost += cost;
+            self.buf_cost -= cost;
+            batch.push((change, src, queued_at));
+            if batch_cost >= target_size {
+                break;
+            }
+        }
+
+        if batch.is_empty() {
+            return None;
+        }
+
+        debug!(count = %batch_cost, reason = %reason, batch_size = %self.current_batch_size, "spawning batch processing task");
+
+        let agent_clone = agent.clone();
+        let bookie_clone = bookie.clone();
+        self.processing_task = Some(tokio::spawn(process_multiple_changes(
+            agent_clone,
+            bookie_clone,
+            batch,
+            self.tx_timeout,
+        )));
+        counter!("corro.agent.changes.batch.spawned").increment(1);
+        gauge!("corro.agent.changes.batch_size").set(self.current_batch_size as f64);
+
+        Some(batch_cost)
+    }
+
+    /// Handle task completion and decide whether to spawn next batch
+    fn handle_task_completion(
+        &mut self,
+        agent: &Agent,
+        bookie: &Bookie,
+        result: Result<Result<(), corro_types::agent::ChangeError>, tokio::task::JoinError>,
+    ) {
+        // Handle task result
+        match result {
+            Ok(Ok(())) => {
+                debug!("batch processing completed successfully");
+            }
+            Ok(Err(ref e)) => {
+                error!("error processing batch: {e}");
+
+                if let Some(issue) = e.fatal_db_issue() {
+                    error!("fatal DB issue detected: {issue}");
+                    agent.mark_unhealthy(issue);
+                }
+
+                // Check for memory errors and emergency reduce batch size
+                // TODO: requeue the changes
+                if e.is_oom_error() || e.is_interrupt_error() {
+                    if self.current_batch_size == self.min_batch_size {
+                        error!(?e, current_batch_size = %self.current_batch_size, min_batch_size = %self.min_batch_size, "batch too large for the database to process, but already at min_batch_size — min_batch_size may be too large or transaction timeout may be misconfigured");
+                    } else {
+                        error!(?e, current_batch_size = %self.current_batch_size, "batch too large for the database to process, halving batch size");
+                    }
+                    self.current_batch_size =
+                        (self.current_batch_size / 2).max(self.min_batch_size);
+                    self.halved_at = Some(Instant::now());
+                }
+            }
+            Err(ref e) => {
+                error!("batch processing task panicked: {e}");
+            }
+        }
+
+        self.processing_task = None;
+
+        // Should we spawn immediately with queued changes?
+        if self.buf_cost >= self.batch_threshold() {
+            // YES - enough changes queued, spawn immediately
+            // Check if we might want to burst
+            if self.buf_cost > self.current_batch_size {
+                self.current_batch_size = self.calculate_batch_size(self.buf_cost);
+            }
+            if self
+                .drain_and_spawn(
+                    agent,
+                    bookie,
+                    self.current_batch_size,
+                    "immediate-after-completion",
+                )
+                .is_none()
+            {
+                unreachable!("Must spawn a batch");
+            }
+        } else {
+            // NO - not enough changes yet, start timeout
+            self.max_wait = Some(Box::pin(tokio::time::sleep(self.timeout_duration)));
+        }
+    }
+
+    /// Handle timeout - spawn whatever we have
+    /// The amount of changes MUST be smaller than the threshold
+    /// as otherwise other code paths would have spawned a batch
+    fn handle_timeout(&mut self, agent: &Agent, bookie: &Bookie) {
+        self.max_wait = None;
+
+        if !self.queue.is_empty() {
+            let actual_cost = self.buf_cost;
+            let threshold = self.batch_threshold();
+            // Other code paths should have spawned a batch by now!
+            assert_always!(actual_cost < threshold, "Timeout with too many changes");
+            // Just process whatever we have and then downsize the batch size
+            if self
+                .drain_and_spawn(agent, bookie, usize::MAX, "timeout")
+                .is_none()
+            {
+                unreachable!("Must spawn a batch");
+            }
+
+            assert_sometimes!(true, "Corrosion processes changes");
+            // Adjust batch size based on what we had processed
+            // This will decrease the batch size unless it's already at the minimum
+            self.current_batch_size = self.calculate_batch_size(actual_cost);
+        } else if self.processing_task.is_none() && self.max_wait.is_none() {
+            // Empty queue, no task running, no timeout set
+            self.current_batch_size = self.calculate_batch_size(0);
+            // If no task is running and no timeout is set, start timeout
+            // This ensures changes get processed even if they don't hit the threshold
+            self.max_wait = Some(Box::pin(tokio::time::sleep(self.timeout_duration)));
+        }
+    }
+
+    // Drops oldest items when the queue is full
+    fn maybe_drop_old_change(&mut self) -> Option<ChangeV1> {
+        let mut dropped_count = 0;
+
+        if self.queue.len() >= self.max_queue_len {
+            if let Some((dropped_change, _, _)) = self.queue.pop_front() {
+                self.buf_cost -= dropped_change.processing_cost();
+                dropped_count += 1;
+
+                counter!("corro.agent.changes.dropped").increment(dropped_count);
+                log_at_pow_10("dropped old change from queue", &mut self.drop_log_count);
+                Some(dropped_change)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Handle new change arrival - check if we should spawn immediately
+    fn handle_new_change(
+        &mut self,
+        agent: &Agent,
+        bookie: &Bookie,
+        change: ChangeV1,
+        src: ChangeSource,
+    ) {
+        let cost = change.processing_cost();
+        self.queue.push_back((change, src, Instant::now()));
+        self.buf_cost += cost;
+
+        // Check if we should spawn immediately (threshold-based)
+        if self.buf_cost >= self.batch_threshold() && self.processing_task.is_none() {
+            // Cancel any pending timeout
+            self.max_wait = None;
+
+            // Check if we might want to burst
+            if self.buf_cost > self.current_batch_size {
+                self.current_batch_size = self.calculate_batch_size(self.buf_cost);
+            }
+
+            // Drain and spawn
+            if self
+                .drain_and_spawn(
+                    agent,
+                    bookie,
+                    self.current_batch_size,
+                    "size-threshold-on-new-change",
+                )
+                .is_none()
+            {
+                unreachable!("Must spawn a batch");
+            }
+        }
+    }
+}
+
 /// Bundle incoming changes to optimise transaction sizes with SQLite
 ///
 /// *Performance tradeoff*: introduce latency (with a max timeout) to
@@ -619,24 +996,26 @@ fn calc_busy_timeout(wal_size: u64, threshold: u64) -> u64 {
 pub async fn handle_changes(
     agent: Agent,
     bookie: Bookie,
-    mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
+    mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     mut tripwire: Tripwire,
 ) {
-    let max_changes_chunk: usize = agent.config().perf.apply_queue_len;
     let max_queue_len: usize = agent.config().perf.processing_queue_len;
-    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
-    let mut queue: VecDeque<(ChangeV1, ChangeSource, Instant)> = VecDeque::new();
-    let mut buf = vec![];
-    let mut buf_cost = 0;
+    let maintenance_duration =
+        Duration::from_millis(agent.config().perf.apply_queue_timeout.max(1) as u64);
 
-    const MAX_CONCURRENT: usize = 5;
-    let mut join_set = JoinSet::new();
-
-    let mut max_wait = tokio::time::interval(Duration::from_millis(
-        agent.config().perf.apply_queue_timeout as u64,
-    ));
+    // Initialize batch processor state
+    let mut state = HandleChangesState::new(
+        agent.config().perf.apply_queue_min_batch_size,
+        agent.config().perf.apply_queue_step_base,
+        agent.config().perf.apply_queue_max_batch_size,
+        agent.config().perf.apply_queue_batch_threshold_ratio,
+        Duration::from_millis(agent.config().perf.apply_queue_timeout as u64),
+        Duration::from_secs(agent.config().perf.sql_tx_timeout as u64),
+        max_queue_len,
+    );
 
     let max_seen_cache_len: usize = max_queue_len;
+    let metrics_tracker = agent.metrics_tracker();
 
     // unlikely, but max_seen_cache_len can be less than 10, in that case we want to just clear the whole cache
     // (todo): put some validation in config instead
@@ -646,103 +1025,74 @@ pub async fn handle_changes(
         0
     };
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
+    let mut maintenance_interval = tokio::time::interval(maintenance_duration);
+    maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let mut drop_log_count: u64 = 0;
-    // complicated loop to process changes efficiently w/ a max concurrency
-    // and a minimum chunk size for bigger and faster SQLite transactions
     loop {
-        while (buf_cost >= max_changes_chunk || (!queue.is_empty() && join_set.is_empty()))
-            && join_set.len() < MAX_CONCURRENT
-        {
-            // Process if we hit the chunk size OR if we have any items and available capacity
-            let mut tmp_cost = 0;
-            while let Some((change, src, queued_at)) = queue.pop_front() {
-                tmp_cost += change.processing_cost();
-                buf.push((change, src, queued_at));
-                if tmp_cost >= max_changes_chunk {
-                    break;
-                }
-            }
-
-            if buf.is_empty() {
-                break;
-            }
-
-            debug!(count = %tmp_cost, "spawning processing multiple changes from beginning of loop");
-            let changes = std::mem::take(&mut buf);
-            let agent = agent.clone();
-            let bookie = bookie.clone();
-            join_set.spawn(process_multiple_changes(
-                agent,
-                bookie,
-                changes.clone(),
-                tx_timeout,
-            ));
-            counter!("corro.agent.changes.batch.spawned").increment(1);
-
-            buf_cost -= tmp_cost;
-        }
-
-        let (change, src) = tokio::select! {
+        let (change, src, original_bcast) = tokio::select! {
             biased;
 
-            // process these first, we don't care about the result,
-            // but we need to drain it to free up concurrency
-            res = join_set.join_next(), if !join_set.is_empty() => {
-                debug!("processed multiple changes concurrently");
-                if let Some(Ok(Err(e))) = res {
-                    error!("could not process multiple changes: {e}");
+            // Queue metrics and cache maintenance must keep running while a
+            // processing task and its backlog keep the batching timeout disabled.
+            _ = maintenance_interval.tick() => {
+                gauge!("corro.agent.changes.in_queue").set(state.buf_cost as f64);
+                gauge!("corro.agent.changesets.in_queue").set(state.queue.len() as f64);
+                gauge!("corro.agent.changes.processing.jobs").set(if state.processing_task.is_some() { 1.0 } else { 0.0 });
+                metrics_tracker.observe_queue_size(state.queue.len() as u64);
+
+                if seen.len() > max_seen_cache_len {
+                    seen.drain(..seen.len() - keep_seen_cache_size);
                 }
+
                 continue;
             },
 
+            // Processing task finished
+            res = async { state.processing_task.as_mut().unwrap().await }, if state.processing_task.is_some() => {
+                state.handle_task_completion(&agent, &bookie, res);
+                continue;
+            },
+
+            // New changes arrive
             maybe_change_src = rx_changes.recv() => match maybe_change_src {
-                Some((change, src)) => (change, src),
+                Some((change, src, original_bcast)) => (change, src, original_bcast),
                 None => break,
             },
 
-            _ = max_wait.tick() => {
-                // got a wait interval tick...
+            // Timeout fires
+            _ = async { state.max_wait.as_mut().unwrap().await }, if state.max_wait.is_some() => {
+                state.handle_timeout(&agent, &bookie);
 
-                gauge!("corro.agent.changes.in_queue").set(buf_cost as f64);
-                gauge!("corro.agent.changesets.in_queue").set(queue.len() as f64);
-                gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
-
-                if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
-                    // we can process this right away
-                    debug!(%buf_cost, "spawning processing multiple changes from max wait interval");
-                    assert_sometimes!(true, "Corrosion processes changes");
-                    let changes: Vec<_> = queue.drain(..).collect();
-                    let agent = agent.clone();
-                    let bookie = bookie.clone();
-                    join_set.spawn(process_multiple_changes(agent, bookie, changes.clone(), tx_timeout));
-                    counter!("corro.agent.changes.batch.spawned").increment(1);
-                    buf_cost = 0;
-                }
-
-                if seen.len() > max_seen_cache_len {
-                    // we don't want to keep too many entries in here.
-                    seen.drain(..seen.len() - keep_seen_cache_size);
-                }
-                continue
+                continue;
             },
 
+            // Corrosion is shutting down
             _ = &mut tripwire => {
                 break;
             }
         };
 
+        if let Err(error) = change.validate() {
+            warn!(actor_id = %change.actor_id, %error, "dropping change with an invalid range");
+            continue;
+        }
+
         let change_len = change.len();
         counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
 
+        // Skip changes from ourselves
         if change.actor_id == agent.actor_id() {
             continue;
         }
 
+        // Skip changes we've already seen recently in the seen cache
         if let Some(mut seqs) = change.seqs() {
             let v = change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
                 if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                    if matches!(src, ChangeSource::Broadcast) {
+                        counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
+                    }
                     continue;
                 }
             }
@@ -756,6 +1106,7 @@ pub async fn handle_changes(
             continue;
         }
 
+        // Update logical clock if needed
         let src_str: &'static str = src.into();
         let recv_lag = change.ts().and_then(|ts| {
             let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
@@ -775,20 +1126,10 @@ pub async fn handle_changes(
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
         }
 
-        let booked = {
-            bookie
-                .read("handle_change(get)", change.actor_id.as_simple())
-                .await
-                .get(&change.actor_id)
-                .cloned()
-        };
-
+        // Skip changes we've already seen in the bookie
+        let booked = bookie.get(&change.actor_id);
         if let Some(booked) = booked {
-            if booked
-                .read("handle_change(contains?)", change.actor_id.as_simple())
-                .await
-                .contains_all(change.versions(), change.seqs())
-            {
+            if booked.read().contains_all(change.versions(), change.seqs()) {
                 trace!("already seen, stop disseminating");
                 if matches!(src, ChangeSource::Broadcast) {
                     counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
@@ -797,33 +1138,25 @@ pub async fn handle_changes(
             }
         }
 
-        // drop old items when the queue is full.
-        if queue.len() >= max_queue_len {
-            let mut dropped_count = 0;
-            if let Some((dropped_change, _, _)) = queue.pop_front() {
-                for v in dropped_change.versions() {
-                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
-                        if let Some(seqs) = dropped_change.seqs() {
-                            entry.get_mut().remove(seqs.into());
-                        } else {
-                            entry.swap_remove_entry();
-                        }
-                    };
-                }
-
-                buf_cost -= dropped_change.processing_cost();
-                dropped_count += 1;
-            }
-            counter!("corro.agent.changes.dropped").increment(dropped_count);
-
-            log_at_pow_10("dropped old change from queue", &mut drop_log_count);
-        }
-
         if let Some(recv_lag) = recv_lag {
             histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
                 .record(recv_lag.as_secs_f64());
         }
 
+        // If we need to drop an old change, drop it from the seen cache aswell
+        while let Some(dropped_change) = state.maybe_drop_old_change() {
+            for v in dropped_change.versions() {
+                if let Entry::Occupied(mut entry) = seen.entry((dropped_change.actor_id, v)) {
+                    if let Some(seqs) = dropped_change.seqs() {
+                        entry.get_mut().remove(seqs.into());
+                    } else {
+                        entry.swap_remove_entry();
+                    }
+                };
+            }
+        }
+
+        // Register the new change in the seen cache
         // this will only run once for a non-empty changeset
         for v in change.versions() {
             let entry = seen.entry((change.actor_id, v)).or_default();
@@ -836,23 +1169,15 @@ pub async fn handle_changes(
             matches!(src, ChangeSource::Sync),
             "Corrosion receives changes through sync"
         );
+
+        // Rebroadcast changes received from broadcast (gossip method).
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
             assert_sometimes!(true, "Corrosion rebroadcasts changes");
-            if let Err(_e) =
-                agent
-                    .tx_bcast()
-                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(
-                        change.clone(),
-                    )))
-            {
-                debug!("broadcasts are full or done!");
-            }
+            agent.broadcaster().rebroadcast(&change, original_bcast);
         }
 
-        let cost = change.processing_cost();
-        queue.push_back((change, src, Instant::now()));
-
-        buf_cost += cost; // tracks the cost, not number of changes
+        // Handle the new change - queue it and potentially spawn a batch
+        state.handle_new_change(&agent, &bookie, change, src);
     }
 }
 
@@ -868,13 +1193,12 @@ pub async fn handle_sync(
 ) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
-    for (actor_id, needed) in sync_state.need.iter() {
-        gauge!("corro.sync.client.needed", "actor_id" => actor_id.to_string())
-            .set(needed.len() as f64);
-    }
-    for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(version.0 as f64);
-    }
+    let needed_total = sync_state
+        .need
+        .values()
+        .map(|needed| needed.len() as u64)
+        .sum::<u64>();
+    gauge!("corro.sync.client.needed.v2", "traffic" => "sync").set(needed_total as f64);
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
         let candidates = {
@@ -969,13 +1293,13 @@ pub async fn handle_sync(
 #[cfg(test)]
 mod tests {
     use crate::agent::setup;
-    use crate::api::public::api_v1_db_schema;
+    use crate::agent::util::execute_schema;
 
     use super::*;
-    use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
+        agent::ChangeError,
         base::{dbsr, dbvr, CrsqlDbVersion},
         broadcast::Changeset,
         change::Change,
@@ -1015,15 +1339,15 @@ mod tests {
             .gossip_addr("127.0.0.1:0".parse()?)
             .api_addr("127.0.0.1:0".parse()?)
             .build()?;
-        config.perf.apply_queue_len = 1;
         config.perf.processing_queue_len = 3;
+        config.perf.apply_queue_min_batch_size = 1;
+        config.perf.apply_queue_max_batch_size = 1;
+        config.perf.apply_queue_step_base = 0;
         config.perf.changes_channel_len = 1;
 
         let (agent, agent_options) = setup(config, tripwire.clone()).await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let other_actor = ActorId(uuid::Uuid::new_v4());
         let bookie = Bookie::new(Default::default());
@@ -1068,6 +1392,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    None,
                 );
 
                 agent.tx_changes().send(change).await?;
@@ -1076,16 +1401,284 @@ mod tests {
 
         sleep(Duration::from_secs(2)).await;
 
-        let bookie = bookie.read::<&str, _>("read booked", None).await;
-        let booked = bookie
-            .get(&other_actor)
-            .unwrap()
-            .read::<&str, _>("test", None)
-            .await;
-        assert!(booked.contains_all(dbvr!(6, 10), None));
+        let booked = bookie.get(&other_actor).unwrap().read();
+
+        // With batch_size=1 and queue_len=3, the behavior is:
+        // - Version 10 processes immediately (first change, hits threshold)
+        // - While 10 is blocked on write lock, versions 9-1 arrive
+        // - Queue fills (max 3): holds 9,8,7 then 8,7,6 then 7,6,5 then 6,5,4 then 5,4,3 then 4,3,2 then 3,2,1
+        // - After 10 completes, versions 3,2,1 process (what's left in queue)
+        // - Versions 9,8,7,6,5,4 were dropped (load shedding)
+        assert!(booked.contains_version(&CrsqlDbVersion(10)));
         assert!(booked.contains_all(dbvr!(1, 3), None));
-        assert!(!booked.contains_version(&CrsqlDbVersion(5)));
         assert!(!booked.contains_version(&CrsqlDbVersion(4)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(5)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(6)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(7)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(8)));
+        assert!(!booked.contains_version(&CrsqlDbVersion(9)));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_loadshed_seen_cache_evicts_dropped_actor() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        config.perf.processing_queue_len = 4;
+        // batch size 2 so batch_threshold() stays >= 1: with batch size 1 the
+        // threshold truncates to 0 and handle_task_completion hits its
+        // unreachable!() on an empty queue, killing the task
+        config.perf.apply_queue_min_batch_size = 2;
+        config.perf.apply_queue_max_batch_size = 2;
+        config.perf.apply_queue_step_base = 0;
+        config.perf.changes_channel_len = 1;
+
+        let (agent, agent_options) = setup(config, tripwire.clone()).await?;
+
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let actor_a = ActorId(uuid::Uuid::new_v4());
+        let actor_b = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        tokio::spawn(handle_changes(
+            agent.clone(),
+            bookie.clone(),
+            agent_options.rx_changes,
+            tripwire,
+        ));
+
+        let partial = |actor: ActorId, version: u64, seq: u64| {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(seq as i64 + 1 + version as i64 * 100).into()]).unwrap(),
+                cid: ColumnName("text".into()),
+                val: "partial".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(seq),
+                site_id: actor.to_bytes(),
+                cl: 1,
+            };
+            (
+                ChangeV1 {
+                    actor_id: actor,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(version),
+                        changes: vec![crsql_row],
+                        seqs: (CrsqlSeq(seq)..=CrsqlSeq(seq)).into(),
+                        // last_seq beyond the sent seqs => incomplete (buffered) changeset
+                        last_seq: CrsqlSeq(3),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Broadcast,
+                None,
+            )
+        };
+
+        {
+            // hold the write connection so the first processed change blocks
+            let _conn = agent.pool().write_normal().await?;
+
+            // a complete change from B: gets drained immediately and blocks on the
+            // write connection, leaving the queue free to fill up
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![1i64.into()])?,
+                cid: ColumnName("text".into()),
+                val: "b ten".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(10),
+                seq: CrsqlSeq(0),
+                site_id: actor_b.to_bytes(),
+                cl: 1,
+            };
+            agent
+                .tx_changes()
+                .send((
+                    ChangeV1 {
+                        actor_id: actor_b,
+                        changeset: Changeset::Full {
+                            version: CrsqlDbVersion(10),
+                            changes: vec![crsql_row],
+                            seqs: dbsr!(0, 0),
+                            last_seq: CrsqlSeq(0),
+                            ts: agent.clock().new_timestamp().into(),
+                        },
+                    },
+                    ChangeSource::Broadcast,
+                    None,
+                ))
+                .await?;
+
+            // fill the queue (len 4) with actor A's partial seqs 0..=3 of version 1
+            for seq in 0u64..=3 {
+                agent.tx_changes().send(partial(actor_a, 1, seq)).await?;
+            }
+
+            // actor B's change arrives with the queue full: A's seq 0 gets dropped.
+            // Its seen-cache entry must be evicted under (actor_a, v1).
+            agent.tx_changes().send(partial(actor_b, 1, 0)).await?;
+        }
+
+        sleep(Duration::from_secs(2)).await;
+
+        {
+            let booked_a = bookie.get(&actor_a).unwrap().read();
+            // sanity: seqs 1..=3 of A's v1 were processed, seq 0 was dropped
+            assert!(booked_a.contains_all(dbvr!(1, 1), Some(dbsr!(1, 3))));
+            assert!(!booked_a.contains_all(dbvr!(1, 1), Some(dbsr!(0, 0))));
+        }
+
+        // the dropped change arrives again (another peer rebroadcasts it); with the
+        // seen-cache entry properly evicted it must be accepted and processed
+        agent.tx_changes().send(partial(actor_a, 1, 0)).await?;
+
+        sleep(Duration::from_secs(2)).await;
+
+        let booked_a = bookie.get(&actor_a).unwrap().read();
+        assert!(
+            booked_a.contains_all(dbvr!(1, 1), Some(dbsr!(0, 0))),
+            "re-sent copy of the dropped change was filtered as a duplicate: \
+             the seen cache still holds the entry that should have been evicted \
+             when the change was dropped from the full queue"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_seen_cache_trim_runs_while_backlogged() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        config.perf.processing_queue_len = 4;
+        config.perf.apply_queue_min_batch_size = 2;
+        config.perf.apply_queue_max_batch_size = 2;
+        config.perf.apply_queue_step_base = 0;
+        config.perf.apply_queue_batch_threshold_ratio = 1.0;
+        config.perf.apply_queue_timeout = 20;
+        // A one-slot channel: every send below returns only once the handler has
+        // taken the previous change, so the queue and the seen cache are already
+        // built up by the time the test sleeps.
+        config.perf.changes_channel_len = 1;
+
+        let (agent, agent_options) = setup(config, tripwire.clone()).await?;
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        // Hold the only write permit. Every batch the handler spawns blocks on
+        // it before it reaches SQLite, so the queue stays backlogged and the
+        // batching timeout stays disarmed for as long as this is held. Nothing
+        // here depends on how long a SQLite busy handler waits.
+        let permit = agent.write_permit().await?;
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        let handler = tokio::spawn(handle_changes(
+            agent.clone(),
+            bookie.clone(),
+            agent_options.rx_changes,
+            tripwire,
+        ));
+
+        let change = |version: u64| -> eyre::Result<_> {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(version as i64).into()])?,
+                cid: ColumnName("text".into()),
+                val: format!("version {version}").into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(0),
+                site_id: other_actor.to_bytes(),
+                cl: 1,
+            };
+            Ok((
+                ChangeV1 {
+                    actor_id: other_actor,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(version),
+                        changes: vec![crsql_row],
+                        seqs: dbsr!(0, 0),
+                        last_seq: CrsqlSeq(0),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Sync,
+                None,
+            ))
+        };
+
+        // Versions 1 and 2 are drained into the blocked batch. Versions 3 and 4
+        // are then pushed out of the four-slot queue by 7 and 8. Dropping a full
+        // change takes its sequences out of the seen cache but keeps its key, so
+        // the cache now holds eight keys against a cap of four.
+        for version in 1..=8 {
+            agent.tx_changes().send(change(version)?).await?;
+        }
+
+        // Ten apply timeouts. The batch is still blocked and the queue is still
+        // backlogged for every one of them, so max_wait stays disarmed and only
+        // the maintenance tick can trim the cache.
+        sleep(Duration::from_millis(200)).await;
+        assert!(
+            !bookie
+                .get(&other_actor)
+                .is_some_and(|booked| booked.read().contains_version(&CrsqlDbVersion(3))),
+            "the write permit should keep every batch out of SQLite"
+        );
+
+        // Version 3 was dropped from the queue and is in no batch, so nothing
+        // will ever book it. An empty changeset is deduplicated on the seen-cache
+        // key alone, so this copy survives only if maintenance trimmed the cache
+        // during the backlog.
+        agent
+            .tx_changes()
+            .send((
+                ChangeV1 {
+                    actor_id: other_actor,
+                    changeset: Changeset::Empty {
+                        versions: dbvr!(3, 3),
+                        ts: Some(agent.clock().new_timestamp().into()),
+                    },
+                },
+                ChangeSource::Sync,
+                None,
+            ))
+            .await?;
+
+        drop(permit);
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if bookie
+                    .get(&other_actor)
+                    .is_some_and(|booked| booked.read().contains_version(&CrsqlDbVersion(3)))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        handler.await?;
 
         Ok(())
     }
@@ -1102,7 +1695,7 @@ mod tests {
 
         println!("temp db: {db_path:?}");
         let write_sema = Arc::new(Semaphore::new(1));
-        let pool = SplitPool::create(db_path, write_sema.clone()).await?;
+        let pool = SplitPool::create(db_path, write_sema.clone(), -1048576).await?;
 
         {
             let mut conn = pool.write_priority().await?;
@@ -1185,5 +1778,458 @@ mod tests {
 
     fn to_bytes(gb: u64) -> u64 {
         gb * 1024 * 1024 * 1024
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_handle_changes_batch_size_bursting() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+
+        // Configure for bursting test:
+        // - min_batch_size: 100
+        // - step_base: 500
+        // - max_batch_size: 16000
+        // - threshold_ratio: 0.9
+        config.perf.apply_queue_min_batch_size = 100;
+        config.perf.apply_queue_step_base = 500;
+        config.perf.apply_queue_max_batch_size = 16000;
+        config.perf.apply_queue_batch_threshold_ratio = 0.9;
+        config.perf.apply_queue_timeout = 10; // 10ms timeout
+        config.perf.processing_queue_len = 50000; // Large queue to avoid dropping old changes
+
+        let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
+
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+
+        // Create a HandleChangesState instance directly
+        let mut state = HandleChangesState::new(
+            config.perf.apply_queue_min_batch_size,
+            config.perf.apply_queue_step_base,
+            config.perf.apply_queue_max_batch_size,
+            config.perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(config.perf.apply_queue_timeout as u64),
+            Duration::from_secs(config.perf.sql_tx_timeout as u64),
+            config.perf.processing_queue_len,
+        );
+
+        // Helper to create a mock change
+        let create_change = |version: u64| -> ChangeV1 {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(version as i64).into()]).unwrap(),
+                cid: ColumnName("text".into()),
+                val: "test value".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(0),
+                site_id: other_actor.to_bytes(),
+                cl: 1,
+            };
+
+            let change = ChangeV1 {
+                actor_id: other_actor,
+                changeset: Changeset::Full {
+                    version: CrsqlDbVersion(version),
+                    changes: vec![crsql_row],
+                    seqs: dbsr!(0, 0),
+                    last_seq: CrsqlSeq(0),
+                    ts: agent.clock().new_timestamp().into(),
+                },
+            };
+
+            assert!(change.processing_cost() == 1);
+
+            change
+        };
+
+        let mut version = 1;
+        let mut simulate_burst = |state: &mut HandleChangesState, count: u64| {
+            for _ in 1..=count {
+                state.handle_new_change(
+                    &agent,
+                    &bookie,
+                    create_change(version),
+                    ChangeSource::Sync,
+                );
+                version += 1;
+            }
+        };
+
+        // Initial batch size should be min_batch_size
+        // Timer should be spawned
+        assert_eq!(state.current_batch_size, 100);
+        assert!(state.max_wait.is_some());
+        assert!(state.processing_task.is_none());
+        assert!(state.buf_cost == 0);
+        assert!(state.queue.is_empty());
+
+        // Timing out with no changes should not spawn a task
+        // The timer should be reset
+        state.handle_timeout(&agent, &bookie);
+        assert!(state.processing_task.is_none());
+        assert!(state.max_wait.is_some());
+        assert!(state.buf_cost == 0);
+        assert!(state.queue.is_empty());
+
+        // Phase 1: Add a few changes (5) - not enough to hit threshold
+        // Threshold = 100 * 0.9 = 90, we'll add 5 changes (cost = 5)
+        simulate_burst(&mut state, 5);
+
+        // Should not have spawned (buf_cost = 5 < threshold = 90)
+        assert!(state.processing_task.is_none());
+        assert_eq!(state.buf_cost, 5);
+        assert_eq!(state.queue.len(), 5);
+
+        // Phase 2: Trigger timeout processing
+        state.handle_timeout(&agent, &bookie);
+
+        // Should have spawned a task now
+        assert!(state.processing_task.is_some());
+        assert_eq!(state.buf_cost, 0); // All drained
+        assert_eq!(state.queue.len(), 0);
+
+        // Batch size should decrease because actual_cost (5) < threshold (90)
+        // when hitting the timeout. We're already at the min batch size, so it
+        // should stay at it
+        assert_eq!(state.current_batch_size, 100);
+
+        // Phase 3: While task is running, simulate a burst of changes
+        // Add 2001 changes (cost = 2001) - this is a burst!
+        simulate_burst(&mut state, 2001);
+
+        // Task is still running, so changes should be queued
+        assert!(state.processing_task.is_some());
+        assert_eq!(state.buf_cost, 2001);
+        assert_eq!(state.queue.len(), 2001);
+
+        // Phase 4: Complete the task successfully
+        // After completion with buf_cost=2001 >= threshold=90:
+        // - Should spawn immediately
+        // - Should burst to batch_size 2000
+        // - No timer should be spawned
+
+        let task = state.processing_task.take().unwrap();
+        let task_result = task.await;
+        state.handle_task_completion(&agent, &bookie, task_result);
+        assert_eq!(state.buf_cost, 1);
+        assert_eq!(state.queue.len(), 1); // Drained ~100
+        assert_eq!(state.current_batch_size, 2000);
+        assert!(state.max_wait.is_none());
+
+        // Phase 5: Complete the second task
+        // - We should not spawn another task cause we are below the threshold of 1800
+        // - The timer should be spawned
+        let task = state.processing_task.take().unwrap();
+        let task_result = task.await;
+        state.handle_task_completion(&agent, &bookie, task_result);
+        assert!(state.processing_task.is_none());
+        assert_eq!(state.buf_cost, 1);
+        assert_eq!(state.queue.len(), 1);
+        assert_eq!(state.current_batch_size, 2000);
+        assert!(state.max_wait.is_some());
+
+        // Phase 6: Simulate another burst of changes
+        // As the batch size is 2000, we should spawn a new task after 1800 changes
+        // The timer should be cancelled
+        simulate_burst(&mut state, 1900);
+        assert!(state.processing_task.is_some());
+        assert_eq!(state.buf_cost, 101);
+        assert_eq!(state.queue.len(), 101);
+        assert_eq!(state.current_batch_size, 2000);
+        assert!(state.max_wait.is_none());
+
+        // Phase 7: Complete the third task
+        // - We should not spawn another task cause we are below the threshold of 1800
+        // - The timer should be spawned
+        let task = state.processing_task.take().unwrap();
+        let task_result = task.await;
+        state.handle_task_completion(&agent, &bookie, task_result);
+        assert!(state.processing_task.is_none());
+        assert_eq!(state.buf_cost, 101);
+        assert_eq!(state.queue.len(), 101);
+        assert_eq!(state.current_batch_size, 2000);
+        assert!(state.max_wait.is_some());
+
+        // Phase 8: Burst below threshold
+        simulate_burst(&mut state, 1000);
+        assert!(state.processing_task.is_none());
+        assert_eq!(state.buf_cost, 1101);
+        assert_eq!(state.queue.len(), 1101);
+        assert_eq!(state.current_batch_size, 2000);
+        assert!(state.max_wait.is_some()); // Timer is still running
+
+        // Phase 9: We timed out, so the batch size should get decreased
+        state.handle_timeout(&agent, &bookie);
+        assert!(state.processing_task.is_some());
+        assert_eq!(state.buf_cost, 0);
+        assert_eq!(state.queue.len(), 0);
+        assert_eq!(state.current_batch_size, 1000);
+        assert!(state.max_wait.is_none());
+
+        // Phase 10: Complete the task
+        let task = state.processing_task.take().unwrap();
+        let task_result = task.await;
+        state.handle_task_completion(&agent, &bookie, task_result);
+        // No instant spawn
+        assert!(state.processing_task.is_none());
+        assert_eq!(state.buf_cost, 0);
+        assert_eq!(state.queue.len(), 0);
+        assert_eq!(state.current_batch_size, 1000);
+        // Timer should be spawned
+        assert!(state.max_wait.is_some());
+
+        // Phase 11: Batch size should return to normal
+        state.handle_timeout(&agent, &bookie);
+        assert!(state.processing_task.is_none());
+        assert_eq!(state.buf_cost, 0);
+        assert_eq!(state.queue.len(), 0);
+        assert_eq!(state.current_batch_size, 100);
+        assert!(state.max_wait.is_some());
+
+        Ok(())
+    }
+
+    /// Build a synthetic ChangeError mimicking a SQLite interrupt
+    /// (e.g. a transaction timeout firing).
+    fn synthetic_interrupt_error() -> ChangeError {
+        ChangeError::Rusqlite {
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::OperationInterrupted,
+                    extended_code: 9, // SQLITE_INTERRUPT
+                },
+                Some("interrupted".to_string()),
+            ),
+            actor_id: None,
+            version: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_handle_task_completion_halves_batch_on_interrupt_error() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+
+        config.perf.apply_queue_min_batch_size = 100;
+        config.perf.apply_queue_step_base = 500;
+        config.perf.apply_queue_max_batch_size = 16000;
+        config.perf.apply_queue_batch_threshold_ratio = 0.9;
+        config.perf.apply_queue_timeout = 10;
+        config.perf.processing_queue_len = 50000;
+
+        let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
+
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let bookie = Bookie::new(Default::default());
+
+        let mut state = HandleChangesState::new(
+            config.perf.apply_queue_min_batch_size,
+            config.perf.apply_queue_step_base,
+            config.perf.apply_queue_max_batch_size,
+            config.perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(config.perf.apply_queue_timeout as u64),
+            Duration::from_millis(200),
+            config.perf.processing_queue_len,
+        );
+
+        // Phase 1: Halving from well above min halves cleanly.
+        // We don't need a real running task — handle_task_completion is fed
+        // a synthetic Err result directly.
+        state.current_batch_size = 2000;
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(state.current_batch_size, 1000);
+        assert!(state.halved_at.is_some());
+        assert!(state.in_grace_period());
+
+        // Phase 2: Halving clamps to min_batch_size.
+        state.current_batch_size = config.perf.apply_queue_min_batch_size;
+        state.halved_at = None;
+        assert!(!state.in_grace_period());
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(
+            state.current_batch_size,
+            config.perf.apply_queue_min_batch_size
+        );
+        assert!(state.in_grace_period());
+
+        // Phase 3: Grace period allows deflation.
+        state.current_batch_size = 2000;
+        assert!(state.in_grace_period());
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(state.current_batch_size, 1000);
+        assert!(state.halved_at.is_some());
+        assert!(state.in_grace_period());
+
+        // Waiting will reset the grace period
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!state.in_grace_period());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_grace_period_prevents_batch_size_re_inflation() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+
+        config.perf.apply_queue_min_batch_size = 100;
+        config.perf.apply_queue_step_base = 500;
+        config.perf.apply_queue_max_batch_size = 16000;
+        config.perf.apply_queue_batch_threshold_ratio = 0.9;
+        config.perf.apply_queue_timeout = 10;
+        config.perf.processing_queue_len = 50000;
+
+        let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
+
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+
+        let mut state = HandleChangesState::new(
+            config.perf.apply_queue_min_batch_size,
+            config.perf.apply_queue_step_base,
+            config.perf.apply_queue_max_batch_size,
+            config.perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(config.perf.apply_queue_timeout as u64),
+            Duration::from_secs(config.perf.sql_tx_timeout as u64),
+            config.perf.processing_queue_len,
+        );
+
+        // Same mock-change helper as test_handle_changes_batch_size_bursting.
+        let create_change = |version: u64| -> ChangeV1 {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(version as i64).into()]).unwrap(),
+                cid: ColumnName("text".into()),
+                val: "test value".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(0),
+                site_id: other_actor.to_bytes(),
+                cl: 1,
+            };
+            let change = ChangeV1 {
+                actor_id: other_actor,
+                changeset: Changeset::Full {
+                    version: CrsqlDbVersion(version),
+                    changes: vec![crsql_row],
+                    seqs: dbsr!(0, 0),
+                    last_seq: CrsqlSeq(0),
+                    ts: agent.clock().new_timestamp().into(),
+                },
+            };
+            assert!(change.processing_cost() == 1);
+            change
+        };
+
+        let mut version = 1;
+        let mut simulate_burst = |state: &mut HandleChangesState, count: u64| {
+            for _ in 1..=count {
+                state.handle_new_change(
+                    &agent,
+                    &bookie,
+                    create_change(version),
+                    ChangeSource::Sync,
+                );
+                version += 1;
+            }
+        };
+
+        // Phase 1: A burst inflates the batch size normally.
+        // Same setup as test_handle_changes_batch_size_bursting: first drain a
+        // small below-threshold batch via timeout so the subsequent 2001-item
+        // burst fully queues while the task runs. On completion, buf_cost=2001
+        // drives calculate_batch_size(2001) = 500 * (1 << ilog2(4)) = 2000.
+        simulate_burst(&mut state, 5);
+        state.handle_timeout(&agent, &bookie);
+        simulate_burst(&mut state, 2001);
+        let task = state.processing_task.take().unwrap();
+        let _ = task.await;
+        state.handle_task_completion(&agent, &bookie, Ok(Ok(())));
+        assert_eq!(state.current_batch_size, 2000);
+        assert!(state.halved_at.is_none());
+
+        // Phase 2: Emergency halving due to interrupt error.
+        // Batch size halves to 1000 and enters grace period.
+        let task = state.processing_task.take().unwrap();
+        let _ = task.await;
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(state.current_batch_size, 1000);
+        assert!(state.in_grace_period());
+
+        // Phase 3: Grace period blocks re-inflation in handle_task_completion.
+        // Queue up a burst that would normally drive calculate_batch_size way
+        // above 1000. Complete the currently-running task with Ok(Ok(())) —
+        // handle_task_completion's "immediate-after-completion" burst path
+        // would normally set batch_size = calculate_batch_size(buf_cost) but
+        // grace period clamps it to current_batch_size (1000).
+        simulate_burst(&mut state, 5000);
+        assert!(
+            state.buf_cost >= 4000,
+            "burst must be big enough to force inflation attempt"
+        );
+        let task = state.processing_task.take().unwrap();
+        let _ = task.await;
+        state.handle_task_completion(&agent, &bookie, Ok(Ok(())));
+        assert_eq!(
+            state.current_batch_size, 1000,
+            "grace period must prevent inflation even on successful completion"
+        );
+        assert!(
+            state.in_grace_period(),
+            "successful completion must NOT clear grace period"
+        );
+
+        // Clean up the spawned task from Phase 3.
+        if let Some(task) = state.processing_task.take() {
+            let _ = task.await;
+        }
+
+        // Phase 4: Once the grace period expires, calculate_batch_size is
+        // free to inflate again. Force expiry by backdating halved_at past
+        // tx_timeout.
+        assert!(state.in_grace_period());
+        let clamped = state.calculate_batch_size(5000);
+        assert_eq!(
+            clamped, state.current_batch_size,
+            "during grace period, calculate_batch_size must clamp to current_batch_size"
+        );
+        state.halved_at =
+            Some(Instant::now() - Duration::from_secs(config.perf.sql_tx_timeout as u64 + 1));
+        assert!(!state.in_grace_period());
+        let inflated = state.calculate_batch_size(5000);
+        assert!(
+            inflated > state.current_batch_size,
+            "after grace period, calculate_batch_size must be free to inflate (got {inflated}, current {})",
+            state.current_batch_size,
+        );
+
+        Ok(())
     }
 }
