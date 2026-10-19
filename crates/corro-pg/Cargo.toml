@@ -41,6 +41,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 regex = "1.13.1"
 
 [dev-dependencies]
+corro-agent = { path = "../corro-agent" }
 corro-tests = { path = "../corro-tests" }
 tokio-postgres = { version = "0.7.18" }
 tracing-subscriber = { workspace = true }

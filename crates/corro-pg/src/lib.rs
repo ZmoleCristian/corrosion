@@ -2778,6 +2778,15 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::Parse(parse) => {
+                                    if let Err(e) = session.refresh_crsql_schema_if_idle() {
+                                        back_tx.blocking_send(BackendResponse::Message {
+                                            message: e.try_into()?,
+                                            flush: true,
+                                        })?;
+                                        discard_until_sync = true;
+                                        continue;
+                                    }
+
                                     let name: &str = parse.name.as_deref().unwrap_or_default();
                                     tracing::info!(target: "TOOL_DEBUG", query = %parse.query, "parse query");
                                     let (stripped_sql, mut cmds) = match parse_query(&parse.query) {
@@ -3126,6 +3135,15 @@ pub async fn start(
                                     }
                                 }
                                 PgWireFrontendMessage::Bind(bind) => {
+                                    if let Err(e) = session.refresh_crsql_schema_if_idle() {
+                                        back_tx.blocking_send(BackendResponse::Message {
+                                            message: e.try_into()?,
+                                            flush: true,
+                                        })?;
+                                        discard_until_sync = true;
+                                        continue;
+                                    }
+
                                     let portal_name = bind
                                         .portal_name
                                         .as_deref()
@@ -3977,6 +3995,13 @@ struct Session<'conn> {
 }
 
 impl<'conn> Session<'conn> {
+    fn refresh_crsql_schema_if_idle(&self) -> Result<(), QueryError> {
+        if self.tx_state.is_ended() {
+            self.conn.refresh_crsql_schema_if_needed()?;
+        }
+        Ok(())
+    }
+
     fn handle_query(
         &mut self,
         cmd: &ParsedCmd,
@@ -3984,6 +4009,7 @@ impl<'conn> Session<'conn> {
         send_row_desc: bool,
     ) -> Result<(), QueryError> {
         self.validate_transaction_command(cmd)?;
+        self.refresh_crsql_schema_if_idle()?;
 
         if cmd.is_show() {
             back_tx
@@ -4144,6 +4170,7 @@ impl<'conn> Session<'conn> {
         self.validate_transaction_command(cmd)?;
 
         // TODO: maybe we don't need to recompute this...
+        self.refresh_crsql_schema_if_idle()?;
         let fields = field_types(prepped, cmd, FieldFormats::Each(result_formats))?;
 
         trace!("fields: {fields:?}");

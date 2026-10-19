@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::HashMap,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
@@ -380,23 +381,47 @@ pub fn rusqlite_to_crsqlite_write(
     Ok(conn)
 }
 
-pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
-    init_cr_conn(&mut conn)?;
+pub fn rusqlite_to_crsqlite(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+    init_cr_conn(&conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
 
     trace_heavy_queries(&conn)?;
 
-    Ok(CrConn(conn))
+    CrConn::from_initialized(conn)
 }
 
 #[derive(Debug)]
-pub struct CrConn(Connection);
+pub struct CrConn(Connection, Cell<i64>);
 
 impl CrConn {
-    pub fn init(mut conn: Connection) -> Result<Self, rusqlite::Error> {
-        init_cr_conn(&mut conn)?;
-        Ok(Self(conn))
+    fn from_initialized(conn: Connection) -> rusqlite::Result<Self> {
+        let schema_version = conn.pragma_query_value(None, "schema_version", |row| row.get(0))?;
+        Ok(Self(conn, Cell::new(schema_version)))
+    }
+
+    pub fn init(conn: Connection) -> Result<Self, rusqlite::Error> {
+        init_cr_conn(&conn)?;
+        Self::from_initialized(conn)
+    }
+
+    /// Refresh the shipped extension's table cache between PostgreSQL commands.
+    pub fn refresh_crsql_schema_if_needed(&self) -> rusqlite::Result<()> {
+        // Reloading while a transaction or suspended cursor owns extension state
+        // would invalidate that state. Defer until the next idle command.
+        if !self.0.is_autocommit() || self.0.is_busy() {
+            return Ok(());
+        }
+        let schema_version: i64 = self
+            .0
+            .pragma_query_value(None, "schema_version", |row| row.get(0))?;
+        if schema_version != self.1.get() {
+            self.0.flush_prepared_statement_cache();
+            self.0.execute_batch("SELECT crsql_finalize();")?;
+            init_cr_conn(&self.0)?;
+            self.1.set(schema_version);
+        }
+        Ok(())
     }
 
     pub fn immediate_transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
@@ -433,7 +458,7 @@ impl Drop for CrConn {
     }
 }
 
-fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+fn init_cr_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
     let ext_dir = &CRSQL_EXT_DIR;
     trace!(
         "loading crsqlite extension from path: {}",

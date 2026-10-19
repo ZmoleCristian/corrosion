@@ -1059,6 +1059,7 @@ dependencies = [
  "camino",
  "chrono",
  "compact_str 0.7.1",
+ "corro-agent",
  "corro-tests",
  "corro-types",
  "eyre",
